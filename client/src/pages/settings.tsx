@@ -5,7 +5,7 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { useTheme } from "@/components/theme-provider";
-import { Settings as SettingsIcon, Palette, Bell, Code2, Globe, Moon, Sun } from "lucide-react";
+import { Settings as SettingsIcon, Palette, Bell, Code2, Globe, Moon, Sun, Puzzle, AlignLeft, Braces, CheckCircle2 } from "lucide-react";
 
 export default function Settings() {
   const { theme, toggleTheme } = useTheme();
@@ -102,6 +102,57 @@ export default function Settings() {
                 </div>
                 <Switch defaultChecked data-testid="switch-deploy-notify" />
               </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="p-5 space-y-5">
+            <div className="flex items-center gap-2">
+              <Puzzle className="w-4 h-4 text-primary" />
+              <h3 className="text-sm font-semibold">Extensions</h3>
+            </div>
+            <div className="space-y-4">
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-md bg-primary/10 flex items-center justify-center">
+                    <AlignLeft className="w-4 h-4 text-primary" />
+                  </div>
+                  <div>
+                    <Label className="text-sm">Prettier</Label>
+                    <p className="text-xs text-muted-foreground mt-0.5">Code formatter for JS, TS, CSS, HTML, JSON, Markdown, YAML</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Badge variant="secondary" className="text-[10px]">
+                    <CheckCircle2 className="w-3 h-3 mr-1" />
+                    Active
+                  </Badge>
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-md bg-primary/10 flex items-center justify-center">
+                    <Braces className="w-4 h-4 text-primary" />
+                  </div>
+                  <div>
+                    <Label className="text-sm">Emmet</Label>
+                    <p className="text-xs text-muted-foreground mt-0.5">Expand abbreviations in HTML, JSX, TSX, CSS files</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Badge variant="secondary" className="text-[10px]">
+                    <CheckCircle2 className="w-3 h-3 mr-1" />
+                    Active
+                  </Badge>
+                </div>
+              </div>
+            </div>
+            <div className="pt-2 border-t">
+              <p className="text-xs text-muted-foreground">
+                Prettier: Use <kbd className="px-1 py-0.5 rounded bg-muted text-[10px] font-mono">Shift+Alt+F</kbd> or click the Format button in the editor toolbar.
+                Emmet: Type an abbreviation and press <kbd className="px-1 py-0.5 rounded bg-muted text-[10px] font-mono">Tab</kbd> to expand in HTML/CSS files.
+              </p>
             </div>
           </CardContent>
         </Card>

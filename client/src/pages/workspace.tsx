@@ -4,7 +4,7 @@ import { queryClient, apiRequest } from "@/lib/queryClient";
 import { useParams, useLocation } from "wouter";
 import type { Project, ProjectFile } from "@shared/schema";
 import { FileExplorer } from "@/components/file-explorer";
-import { CodeEditor } from "@/components/code-editor";
+import { CodeEditor, type EditorContext } from "@/components/code-editor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,16 +14,37 @@ import SecretsPanel from "@/components/secrets-panel";
 import GitPanel from "@/components/git-panel";
 import ConsolePanel from "@/components/console-panel";
 import AgentPanel from "@/components/agent-panel";
+import DatabasePanel from "@/components/database-panel";
+import PackagePanel from "@/components/package-panel";
 import {
   Files, GitBranch, KeyRound, Rocket, Play, Eye,
   RefreshCw, Loader2, Terminal, Cpu, Square,
   Home, ExternalLink, Globe, Plus, X, Search,
-  Database, Lock, Code2, Settings2
+  Database, Lock, Code2, Settings2, RotateCcw, ScrollText,
+  Folder, HelpCircle, Sun, Moon, Package
 } from "lucide-react";
+import { useTheme } from "@/components/theme-provider";
+import {
+  Breadcrumb,
+  BreadcrumbList,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
+} from "@/components/ui/dialog";
+import {
+  Sheet, SheetContent, SheetTrigger,
+} from "@/components/ui/sheet";
+import { Menu, MessageSquare, PanelRight, Monitor, Tablet, Smartphone, ArrowLeft, ArrowRight, ChevronRight } from "lucide-react";
+import { GlobalSearch } from "@/components/global-search";
 
-type CenterTabKind = "file" | "preview" | "console" | "shell" | "newtab" | "secrets" | "git" | "deploy";
+type CenterTabKind = "file" | "preview" | "console" | "shell" | "newtab" | "secrets" | "git" | "deploy" | "database" | "packages";
 
 interface CenterTab {
   id: string;
@@ -46,6 +67,8 @@ const NEW_TAB_TOOLS = [
   { kind: "shell" as CenterTabKind, icon: Terminal, label: "Shell", desc: "Run bash commands" },
   { kind: "git" as CenterTabKind, icon: GitBranch, label: "Git", desc: "Source control and commits" },
   { kind: "secrets" as CenterTabKind, icon: Lock, label: "Secrets", desc: "Manage environment variables" },
+  { kind: "database" as CenterTabKind, icon: Database, label: "Database", desc: "View tables and run queries" },
+  { kind: "packages" as CenterTabKind, icon: Package, label: "Packages", desc: "Manage npm dependencies" },
   { kind: "deploy" as CenterTabKind, icon: Rocket, label: "Deploy", desc: "Publish your app" },
 ];
 
@@ -54,14 +77,66 @@ export default function Workspace() {
   const [, navigate] = useLocation();
   const { toast } = useToast();
 
-  const [tabs, setTabs] = useState<CenterTab[]>([{ id: "newtab", kind: "newtab", label: "New tab" }]);
-  const [activeTabId, setActiveTabId] = useState<string>("newtab");
+  const [tabs, setTabs] = useState<CenterTab[]>(() => {
+    try {
+      const saved = localStorage.getItem(`workspace-tabs-${id}`);
+      if (saved) {
+        const parsed = JSON.parse(saved) as CenterTab[];
+        if (Array.isArray(parsed) && parsed.length > 0 && parsed.every(t => t.id && t.kind && t.label)) return parsed;
+      }
+    } catch (_) {}
+    return [{ id: "newtab", kind: "newtab", label: "New tab" }];
+  });
+  const [activeTabId, setActiveTabId] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem(`workspace-activeTab-${id}`);
+      const tabsSaved = localStorage.getItem(`workspace-tabs-${id}`);
+      if (saved && tabsSaved) {
+        const parsed = JSON.parse(tabsSaved) as CenterTab[];
+        if (Array.isArray(parsed) && parsed.some(t => t.id === saved)) return saved;
+      }
+    } catch (_) {}
+    return "newtab";
+  });
   const [previewKey, setPreviewKey] = useState(0);
+  const [isRestarting, setIsRestarting] = useState(false);
+  const prevRunningRef = useRef<boolean | undefined>(undefined);
   const [isEditingName, setIsEditingName] = useState(false);
   const [editNameValue, setEditNameValue] = useState("");
   const [newTabSearch, setNewTabSearch] = useState("");
   const [fileSearch, setFileSearch] = useState("");
   const nameInputRef = useRef<HTMLInputElement>(null);
+  const { theme, toggleTheme } = useTheme();
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [mobileAgentOpen, setMobileAgentOpen] = useState(false);
+  const [mobileFilesOpen, setMobileFilesOpen] = useState(false);
+  const [editorContext, setEditorContext] = useState<EditorContext>({
+    activeFile: null,
+    activeFilePath: null,
+    selection: null,
+    cursorLine: null,
+    fileContent: null,
+  });
+  const agentInputRef = useRef<{ setInput: (text: string) => void } | null>(null);
+  const [autoReloadPreview, setAutoReloadPreview] = useState(true);
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      const isInput = target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
+      if (e.key === "?" && !isInput) {
+        e.preventDefault();
+        setShowShortcuts(true);
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "F") {
+        e.preventDefault();
+        setGlobalSearchOpen(true);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   // Draggable panel widths
   const [agentWidth, setAgentWidth] = useState(300);
@@ -90,8 +165,22 @@ export default function Workspace() {
     refetchInterval: 5000,
   });
 
-  const { data: files = [] } = useQuery<ProjectFile[]>({
+  const { data: files = [], isLoading: filesLoading } = useQuery<ProjectFile[]>({
     queryKey: ["/api/projects", id, "files"],
+  });
+
+  const { data: runtimeInfo } = useQuery<{
+    language: string;
+    framework: string;
+    version: string | null;
+    runCommand: string;
+    installCommand: string | null;
+    entryPoint: string | null;
+    icon: string;
+  }>({
+    queryKey: ["/api/projects", id, "runtime"],
+    enabled: !!id,
+    staleTime: 30000,
   });
 
   const activeTab = tabs.find(t => t.id === activeTabId) ?? tabs[0];
@@ -167,13 +256,22 @@ export default function Workspace() {
     }
   }, [files]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(`workspace-tabs-${id}`, JSON.stringify(tabs));
+      localStorage.setItem(`workspace-activeTab-${id}`, activeTabId);
+    } catch (_) {}
+  }, [tabs, activeTabId, id]);
+
   const saveMutation = useMutation({
     mutationFn: async ({ fileId, content }: { fileId: string; content: string }) => {
       await apiRequest("PATCH", `/api/projects/${id}/files/${fileId}`, { content });
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/projects", id, "files"] });
-      setPreviewKey(k => k + 1);
+      if (autoReloadPreview) {
+        setPreviewKey(k => k + 1);
+      }
     },
   });
 
@@ -252,6 +350,18 @@ export default function Workspace() {
     enabled: !!id,
   });
 
+  useEffect(() => {
+    const isNowRunning = appStatus?.running && appStatus?.status === "running" && !!appStatus?.port;
+    const wasRunning = prevRunningRef.current;
+    prevRunningRef.current = !!isNowRunning;
+
+    if (isNowRunning && wasRunning === false) {
+      openTool("preview");
+      const timer = setTimeout(() => setPreviewKey(k => k + 1), 800);
+      return () => clearTimeout(timer);
+    }
+  }, [appStatus, openTool]);
+
   const buildMutation = useMutation({
     mutationFn: async () => { const res = await apiRequest("POST", `/api/projects/${id}/run`); return res.json(); },
     onSuccess: () => {
@@ -284,6 +394,25 @@ export default function Workspace() {
     },
     onError: (err: Error) => toast({ title: "Deploy failed", description: err.message, variant: "destructive" }),
   });
+
+  const handleRestartServer = useCallback(async () => {
+    setIsRestarting(true);
+    try {
+      await apiRequest("POST", `/api/projects/${id}/stop`);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await apiRequest("POST", `/api/projects/${id}/run`);
+      queryClient.invalidateQueries({ queryKey: ["/api/projects", id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/projects", id, "logs"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/projects", id, "status"] });
+      setTimeout(() => {
+        setPreviewKey(k => k + 1);
+        setIsRestarting(false);
+      }, 1500);
+    } catch (err: any) {
+      toast({ title: "Restart failed", description: err.message, variant: "destructive" });
+      setIsRestarting(false);
+    }
+  }, [id, toast]);
 
   if (isLoading) {
     return (
@@ -334,17 +463,25 @@ export default function Workspace() {
   return (
     <div className="h-full flex flex-col bg-background overflow-hidden" data-testid="workspace">
       {/* TOP BAR */}
-      <div className="h-10 flex items-center gap-2 px-3 border-b bg-card/60 backdrop-blur shrink-0">
+      <div className="h-10 flex items-center gap-2 px-2 md:px-3 border-b bg-card/60 backdrop-blur shrink-0">
+        <button
+          onClick={() => setMobileAgentOpen(true)}
+          className="p-1.5 rounded hover:bg-muted text-muted-foreground md:hidden"
+          data-testid="button-mobile-agent"
+        >
+          <MessageSquare className="w-4 h-4" />
+        </button>
+
         <Tooltip>
           <TooltipTrigger asChild>
-            <button onClick={() => navigate("/")} className="p-1.5 rounded hover:bg-muted text-muted-foreground" data-testid="button-go-home">
+            <button onClick={() => navigate("/")} className="p-1.5 rounded hover:bg-muted text-muted-foreground hidden md:flex" data-testid="button-go-home">
               <Home className="w-4 h-4" />
             </button>
           </TooltipTrigger>
           <TooltipContent>Home</TooltipContent>
         </Tooltip>
 
-        <span className="text-xs text-muted-foreground">/</span>
+        <span className="text-xs text-muted-foreground hidden md:inline">/</span>
 
         <div className="flex items-center gap-2 min-w-0">
           <div className={`w-2 h-2 rounded-full shrink-0 ${statusDot}`} />
@@ -367,13 +504,53 @@ export default function Workspace() {
               {project.name}
             </span>
           )}
-          <Badge variant="outline" className="text-[10px] hidden sm:flex">{project.language}</Badge>
-          <Badge variant="outline" className="text-[10px] hidden md:flex">{project.framework}</Badge>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Badge variant="outline" className="text-[10px] hidden sm:flex gap-1">
+                {runtimeInfo?.icon || ""} {runtimeInfo?.language || project.language}
+              </Badge>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              <div className="text-xs space-y-0.5">
+                <div>Runtime: {runtimeInfo?.language || project.language}/{runtimeInfo?.framework || project.framework}</div>
+                {runtimeInfo?.version && <div>Version: {runtimeInfo.version}</div>}
+                {runtimeInfo?.entryPoint && <div>Entry: {runtimeInfo.entryPoint}</div>}
+                {runtimeInfo?.runCommand && <div>Run: {runtimeInfo.runCommand}</div>}
+              </div>
+            </TooltipContent>
+          </Tooltip>
+          <Badge variant="outline" className="text-[10px] hidden md:flex">{runtimeInfo?.framework || project.framework}</Badge>
         </div>
 
         <div className="flex-1" />
 
         <div className="flex items-center gap-1.5 shrink-0">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                className="p-1.5 rounded hover:bg-muted text-muted-foreground transition-colors"
+                onClick={() => setGlobalSearchOpen(true)}
+                data-testid="button-global-search"
+              >
+                <Search className="w-3.5 h-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Search across files (Ctrl+Shift+F)</TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                className="p-1.5 rounded hover:bg-muted text-muted-foreground transition-colors"
+                onClick={toggleTheme}
+                data-testid="button-toggle-theme"
+              >
+                {theme === "dark" ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{theme === "dark" ? "Light mode" : "Dark mode"}</TooltipContent>
+          </Tooltip>
+
           {appPort && (
             <a
               href={`/api/projects/${id}/proxy/`}
@@ -418,10 +595,33 @@ export default function Workspace() {
             <TooltipContent side="bottom">Run config (.agent.json)</TooltipContent>
           </Tooltip>
 
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 w-7 p-0"
+                onClick={() => setShowShortcuts(true)}
+                data-testid="button-keyboard-shortcuts"
+              >
+                <HelpCircle className="w-3.5 h-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Keyboard shortcuts (?)</TooltipContent>
+          </Tooltip>
+
+          <button
+            onClick={() => setMobileFilesOpen(true)}
+            className="p-1.5 rounded hover:bg-muted text-muted-foreground md:hidden"
+            data-testid="button-mobile-files"
+          >
+            <PanelRight className="w-4 h-4" />
+          </button>
+
           <Button
             size="sm"
             variant="outline"
-            className="h-7 gap-1.5 text-xs"
+            className="h-7 gap-1.5 text-xs hidden md:flex"
             onClick={() => { deployMutation.mutate(); }}
             disabled={deployMutation.isPending}
             data-testid="button-deploy"
@@ -432,21 +632,62 @@ export default function Workspace() {
         </div>
       </div>
 
+      {/* Mobile Agent Sheet */}
+      <Sheet open={mobileAgentOpen} onOpenChange={setMobileAgentOpen}>
+        <SheetContent side="left" className="w-[85vw] max-w-[360px] p-0 md:hidden">
+          <AgentPanel projectId={id!} editorContext={editorContext} ref={agentInputRef} />
+        </SheetContent>
+      </Sheet>
+
+      {/* Mobile File Explorer Sheet */}
+      <Sheet open={mobileFilesOpen} onOpenChange={setMobileFilesOpen}>
+        <SheetContent side="right" className="w-[85vw] max-w-[320px] p-0 md:hidden">
+          <div className="flex flex-col h-full">
+            <div className="px-2 py-1.5 border-b bg-card/30 shrink-0">
+              <div className="relative">
+                <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
+                <Input
+                  value={fileSearch}
+                  onChange={e => setFileSearch(e.target.value)}
+                  placeholder="Search files..."
+                  className="h-7 pl-7 text-xs bg-muted/40 border-0 focus-visible:ring-1"
+                />
+              </div>
+            </div>
+            <div className="flex-1 overflow-hidden">
+              <FileExplorer
+                files={files}
+                selectedFile={selectedFileId}
+                onSelectFile={(f) => { openFile(f); setMobileFilesOpen(false); }}
+                onCreateFile={(path, type) => createFileMutation.mutate({ name: path, type })}
+                onDeleteFile={(file) => deleteFileMutation.mutate(file.id)}
+                onRenameFile={(file, newName) => renameFileMutation.mutate({ fileId: file.id, newName, oldPath: file.path })}
+                onOpenShellAt={(dirPath) => {
+                  openTool("shell");
+                  setMobileFilesOpen(false);
+                }}
+                projectId={id!}
+              />
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
+
       {/* MAIN AREA — Agent | Center | File Explorer */}
       <div className="flex-1 flex overflow-hidden">
 
-        {/* LEFT: AI Agent */}
+        {/* LEFT: AI Agent (hidden on mobile) */}
         <div
-          className="shrink-0 border-r bg-card/20 flex flex-col overflow-hidden"
+          className="shrink-0 border-r bg-card/20 flex-col overflow-hidden hidden md:flex"
           style={{ width: agentWidth }}
           data-testid="panel-agent"
         >
-          <AgentPanel projectId={id!} />
+          <AgentPanel projectId={id!} editorContext={editorContext} ref={agentInputRef} />
         </div>
 
-        {/* DRAG HANDLE: Agent | Center */}
+        {/* DRAG HANDLE: Agent | Center (hidden on mobile) */}
         <div
-          className="w-1 shrink-0 bg-border/40 hover:bg-primary/50 cursor-col-resize transition-colors group relative z-10"
+          className="w-1 shrink-0 bg-border/40 hover:bg-primary/50 cursor-col-resize transition-colors group relative z-10 hidden md:block"
           onMouseDown={e => {
             resizingRef.current = { panel: "agent", startX: e.clientX, startW: agentWidth };
             document.body.style.cursor = "col-resize";
@@ -494,15 +735,83 @@ export default function Workspace() {
             </button>
           </div>
 
+          {activeTab?.kind === "file" && selectedFile && (
+            <div className="flex items-center px-3 py-1 border-b bg-card/20 shrink-0 min-h-[28px]">
+              <Breadcrumb>
+                <BreadcrumbList className="text-xs gap-1 sm:gap-1.5">
+                  {(() => {
+                    const filePath = selectedFile.path || selectedFile.name;
+                    const segments = filePath.split("/").filter(Boolean);
+                    return segments.flatMap((segment, index) => {
+                      const isLast = index === segments.length - 1;
+                      const partialPath = segments.slice(0, index + 1).join("/");
+                      const items: React.ReactNode[] = [];
+                      if (index > 0) {
+                        items.push(<BreadcrumbSeparator key={`sep-${partialPath}`} className="[&>svg]:w-3 [&>svg]:h-3" />);
+                      }
+                      items.push(
+                        <BreadcrumbItem key={partialPath}>
+                          {isLast ? (
+                            <BreadcrumbPage className="text-xs flex items-center gap-1">
+                              <Code2 className="w-3 h-3" />
+                              {segment}
+                            </BreadcrumbPage>
+                          ) : (
+                            <BreadcrumbLink
+                              className="text-xs cursor-pointer flex items-center gap-1 hover:text-foreground"
+                              onClick={() => {
+                                const dirFile = files.find(
+                                  f => f.type === "folder" && (f.path === partialPath || f.name === segment)
+                                );
+                                if (dirFile) {
+                                  openFile(dirFile);
+                                }
+                              }}
+                            >
+                              <Folder className="w-3 h-3" />
+                              {segment}
+                            </BreadcrumbLink>
+                          )}
+                        </BreadcrumbItem>
+                      );
+                      return items;
+                    });
+                  })()}
+                </BreadcrumbList>
+              </Breadcrumb>
+            </div>
+          )}
+
           {/* Tab content */}
           <div className="flex-1 overflow-hidden">
-            {activeTab?.kind === "file" && (
+            {activeTab?.kind === "file" && filesLoading && (
+              <div className="p-4 space-y-3">
+                <div className="flex items-center gap-2">
+                  <Skeleton className="h-4 w-4" />
+                  <Skeleton className="h-4 w-48" />
+                </div>
+                {Array.from({ length: 18 }).map((_, i) => (
+                  <div key={i} className="flex items-center gap-3">
+                    <Skeleton className="h-3 w-8 shrink-0" />
+                    <Skeleton className="h-3" style={{ width: `${Math.random() * 50 + 30}%` }} />
+                  </div>
+                ))}
+              </div>
+            )}
+            {activeTab?.kind === "file" && !filesLoading && (
               <CodeEditor
                 file={selectedFile}
                 openFiles={openFiles}
+                allFiles={files}
+                projectId={id}
                 onSave={(fileId, content) => saveMutation.mutate({ fileId, content })}
                 onSelectFile={openFile}
                 onCloseFile={(fileId) => closeTab(`file-${fileId}`)}
+                onEditorContext={setEditorContext}
+                onAskAI={(question) => {
+                  agentInputRef.current?.setInput(question);
+                }}
+                theme={theme}
               />
             )}
 
@@ -519,29 +828,18 @@ export default function Workspace() {
             )}
 
             {activeTab?.kind === "preview" && (
-              <div className="h-full flex flex-col bg-background" data-testid="panel-preview">
-                <div className="flex items-center gap-2 px-3 py-1.5 border-b bg-card/50 shrink-0">
-                  <div className="flex items-center gap-1.5">
-                    <div className="w-2.5 h-2.5 rounded-full bg-[#ff5f57]" />
-                    <div className="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
-                    <div className={`w-2.5 h-2.5 rounded-full ${isAppRunning ? "bg-[#28c840]" : "bg-muted"}`} />
-                  </div>
-                  <div className="flex-1 mx-2">
-                    <div className="bg-muted/60 rounded text-xs text-muted-foreground px-2 py-0.5 font-mono truncate flex items-center gap-1.5">
-                      {isAppRunning && appPort ? (
-                        <><span className="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0 animate-pulse" />localhost:{appPort}</>
-                      ) : "Not running — click Run ▶"}
-                    </div>
-                  </div>
-                  <button className="p-1 rounded hover:bg-muted text-muted-foreground" onClick={() => setPreviewKey(k => k + 1)} data-testid="button-refresh-preview">
-                    <RefreshCw className="w-3.5 h-3.5" />
-                  </button>
-                  <button className="p-1 rounded hover:bg-muted text-muted-foreground" onClick={() => window.open(`/api/projects/${id}/proxy/`, "_blank")} data-testid="button-open-preview">
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-                <iframe key={previewKey} src={`/api/projects/${id}/preview`} className="flex-1 w-full border-0" title="App Preview" data-testid="iframe-preview" />
-              </div>
+              <PreviewPanel
+                projectId={id!}
+                isAppRunning={!!isAppRunning}
+                appPort={appPort}
+                isRestarting={isRestarting}
+                previewKey={previewKey}
+                onRefresh={() => setPreviewKey(k => k + 1)}
+                onRestart={handleRestartServer}
+                onOpenLogs={() => openTool("console")}
+                autoReloadEnabled={autoReloadPreview}
+                onToggleAutoReload={() => setAutoReloadPreview(v => !v)}
+              />
             )}
 
             {activeTab?.kind === "console" && (
@@ -568,6 +866,18 @@ export default function Workspace() {
               </div>
             )}
 
+            {activeTab?.kind === "database" && (
+              <div className="h-full" data-testid="panel-database">
+                <DatabasePanel projectId={id!} />
+              </div>
+            )}
+
+            {activeTab?.kind === "packages" && (
+              <div className="h-full" data-testid="panel-packages-tab">
+                <PackagePanel projectId={id!} />
+              </div>
+            )}
+
             {activeTab?.kind === "deploy" && (
               <div className="h-full" data-testid="panel-deploy-tab">
                 <DeployPanel project={project} onDeploy={() => deployMutation.mutate()} isPending={deployMutation.isPending} />
@@ -576,9 +886,9 @@ export default function Workspace() {
           </div>
         </div>
 
-        {/* DRAG HANDLE: Center | Explorer */}
+        {/* DRAG HANDLE: Center | Explorer (hidden on mobile) */}
         <div
-          className="w-1 shrink-0 bg-border/40 hover:bg-primary/50 cursor-col-resize transition-colors relative z-10"
+          className="w-1 shrink-0 bg-border/40 hover:bg-primary/50 cursor-col-resize transition-colors relative z-10 hidden md:block"
           onMouseDown={e => {
             resizingRef.current = { panel: "explorer", startX: e.clientX, startW: explorerWidth };
             document.body.style.cursor = "col-resize";
@@ -589,9 +899,9 @@ export default function Workspace() {
           title="Drag to resize"
         />
 
-        {/* RIGHT: File Explorer with search */}
+        {/* RIGHT: File Explorer with search (hidden on mobile) */}
         <div
-          className="shrink-0 border-l bg-card/20 flex flex-col overflow-hidden"
+          className="shrink-0 border-l bg-card/20 flex-col overflow-hidden hidden md:flex"
           style={{ width: explorerWidth }}
           data-testid="panel-file-explorer"
         >
@@ -608,7 +918,21 @@ export default function Workspace() {
             </div>
           </div>
           <div className="flex-1 overflow-hidden">
-            {fileSearch.trim() ? (
+            {filesLoading ? (
+              <div className="p-3 space-y-2">
+                <div className="flex items-center gap-1.5 px-1">
+                  <Skeleton className="h-3 w-3" />
+                  <Skeleton className="h-3 w-3.5" />
+                  <Skeleton className="h-3 w-20" />
+                </div>
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <div key={i} className="flex items-center gap-1.5" style={{ paddingLeft: `${(i % 3 > 0 ? 16 : 4)}px` }}>
+                    <Skeleton className="h-3 w-3.5" />
+                    <Skeleton className="h-3" style={{ width: `${Math.random() * 40 + 40}%` }} />
+                  </div>
+                ))}
+              </div>
+            ) : fileSearch.trim() ? (
               <ScrollArea className="h-full">
                 <div className="p-2 space-y-0.5">
                   {filteredFiles.filter(f => f.type === "file").map(f => (
@@ -647,8 +971,64 @@ export default function Workspace() {
           </div>
         </div>
       </div>
+
+      <div className="h-6 flex items-center px-2 md:px-3 border-t bg-card/60 text-[10px] text-muted-foreground shrink-0 gap-2 md:gap-4">
+        <div className="flex items-center gap-1.5">
+          <div className={`w-1.5 h-1.5 rounded-full ${isAppRunning ? "bg-green-500" : appStatus?.status === "starting" ? "bg-yellow-500 animate-pulse" : "bg-muted-foreground/40"}`} />
+          <span>{isAppRunning ? "Running" : appStatus?.status === "starting" ? "Starting..." : "Stopped"}</span>
+        </div>
+        {selectedFile && (
+          <>
+            <span className="text-muted-foreground/40 hidden sm:inline">|</span>
+            <span className="hidden sm:inline truncate max-w-[120px] md:max-w-none">{selectedFile.path}</span>
+            <span className="text-muted-foreground/40 hidden md:inline">|</span>
+            <span className="hidden md:inline">{selectedFile.content.split("\n").length} lines</span>
+            <span className="text-muted-foreground/40 hidden md:inline">|</span>
+            <span className="hidden md:inline">{getLanguageLabel(selectedFile.name)}</span>
+          </>
+        )}
+        <div className="ml-auto flex items-center gap-3">
+          <span className="hidden sm:inline">{project?.language}/{project?.framework}</span>
+          <span className="hidden md:inline">UTF-8</span>
+        </div>
+      </div>
+
+      <KeyboardShortcutsDialog open={showShortcuts} onOpenChange={setShowShortcuts} />
+      <GlobalSearch
+        open={globalSearchOpen}
+        onOpenChange={setGlobalSearchOpen}
+        files={files}
+        onOpenFileAtLine={(file, _line) => {
+          openFile(file);
+        }}
+        onReplaceInFile={(fileId, content) => {
+          saveMutation.mutate({ fileId, content });
+        }}
+      />
     </div>
   );
+}
+
+function getLanguageLabel(fileName: string): string {
+  const ext = fileName.split(".").pop()?.toLowerCase();
+  switch (ext) {
+    case "ts": return "TypeScript";
+    case "tsx": return "TypeScript JSX";
+    case "js": return "JavaScript";
+    case "jsx": return "JavaScript JSX";
+    case "json": return "JSON";
+    case "css": return "CSS";
+    case "scss": return "SCSS";
+    case "html": return "HTML";
+    case "py": return "Python";
+    case "go": return "Go";
+    case "rs": return "Rust";
+    case "md": return "Markdown";
+    case "yml": case "yaml": return "YAML";
+    case "sql": return "SQL";
+    case "sh": return "Shell";
+    default: return ext?.toUpperCase() || "Plain Text";
+  }
 }
 
 function TabIcon({ kind }: { kind: CenterTabKind }) {
@@ -658,6 +1038,8 @@ function TabIcon({ kind }: { kind: CenterTabKind }) {
     case "shell": return <Terminal className="w-3 h-3 shrink-0" />;
     case "git": return <GitBranch className="w-3 h-3 shrink-0" />;
     case "secrets": return <Lock className="w-3 h-3 shrink-0" />;
+    case "database": return <Database className="w-3 h-3 shrink-0" />;
+    case "packages": return <Package className="w-3 h-3 shrink-0" />;
     case "deploy": return <Rocket className="w-3 h-3 shrink-0" />;
     case "newtab": return <Plus className="w-3 h-3 shrink-0" />;
     default: return <Files className="w-3 h-3 shrink-0" />;
@@ -802,5 +1184,242 @@ function DeployPanel({ project, onDeploy, isPending }: { project: Project; onDep
         {isPending ? "Deploying..." : "Deploy to Production"}
       </Button>
     </div>
+  );
+}
+
+const SHORTCUT_GROUPS = [
+  {
+    category: "General",
+    shortcuts: [
+      { keys: ["?"], description: "Show keyboard shortcuts" },
+      { keys: ["Ctrl", "S"], description: "Save current file" },
+      { keys: ["Ctrl", "Z"], description: "Undo" },
+      { keys: ["Ctrl", "Shift", "Z"], description: "Redo" },
+    ],
+  },
+  {
+    category: "Editor",
+    shortcuts: [
+      { keys: ["Ctrl", "Shift", "F"], description: "Search across files" },
+      { keys: ["Ctrl", "F"], description: "Find in file" },
+      { keys: ["Ctrl", "H"], description: "Find and replace" },
+      { keys: ["Ctrl", "G"], description: "Go to line" },
+      { keys: ["Ctrl", "D"], description: "Select next occurrence" },
+      { keys: ["Ctrl", "/"], description: "Toggle line comment" },
+      { keys: ["Tab"], description: "Indent selection" },
+      { keys: ["Shift", "Tab"], description: "Outdent selection" },
+      { keys: ["Alt", "↑"], description: "Move line up" },
+      { keys: ["Alt", "↓"], description: "Move line down" },
+    ],
+  },
+  {
+    category: "Navigation",
+    shortcuts: [
+      { keys: ["Ctrl", "P"], description: "Quick file search" },
+      { keys: ["Ctrl", "Tab"], description: "Switch to next tab" },
+      { keys: ["Ctrl", "Shift", "Tab"], description: "Switch to previous tab" },
+      { keys: ["Ctrl", "W"], description: "Close current tab" },
+      { keys: ["Ctrl", "T"], description: "Open new tab" },
+    ],
+  },
+  {
+    category: "Terminal",
+    shortcuts: [
+      { keys: ["Ctrl", "C"], description: "Cancel running command" },
+      { keys: ["Ctrl", "L"], description: "Clear terminal" },
+      { keys: ["↑"], description: "Previous command" },
+      { keys: ["↓"], description: "Next command" },
+    ],
+  },
+];
+
+const VIEWPORT_MODES = [
+  { id: "desktop", icon: Monitor, label: "Desktop", width: "100%" },
+  { id: "tablet", icon: Tablet, label: "Tablet", width: "768px" },
+  { id: "mobile", icon: Smartphone, label: "Mobile", width: "375px" },
+] as const;
+
+function PreviewPanel({
+  projectId, isAppRunning, appPort, isRestarting, previewKey,
+  onRefresh, onRestart, onOpenLogs, autoReloadEnabled, onToggleAutoReload,
+}: {
+  projectId: string; isAppRunning: boolean; appPort?: number; isRestarting: boolean;
+  previewKey: number; onRefresh: () => void; onRestart: () => void; onOpenLogs: () => void;
+  autoReloadEnabled: boolean; onToggleAutoReload: () => void;
+}) {
+  const [previewPath, setPreviewPath] = useState("/");
+  const [viewportMode, setViewportMode] = useState<"desktop" | "tablet" | "mobile">("desktop");
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const baseUrl = `/api/projects/${projectId}/proxy`;
+  const currentSrc = `${baseUrl}${previewPath}`;
+
+  return (
+    <div className="h-full flex flex-col bg-background" data-testid="panel-preview">
+      <div className="flex items-center gap-1.5 px-2 py-1 border-b bg-card/50 shrink-0">
+        <div className="flex items-center gap-1 shrink-0">
+          <div className="w-2 h-2 rounded-full bg-[#ff5f57]" />
+          <div className="w-2 h-2 rounded-full bg-[#febc2e]" />
+          <div className={`w-2 h-2 rounded-full ${isAppRunning ? "bg-[#28c840]" : "bg-muted"}`} />
+        </div>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button className="p-1 rounded hover:bg-muted text-muted-foreground" onClick={() => setPreviewPath(p => { const parts = p.split("/").filter(Boolean); parts.pop(); return "/" + parts.join("/") || "/"; })} data-testid="button-preview-back">
+              <ArrowLeft className="w-3 h-3" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>Back</TooltipContent>
+        </Tooltip>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button className="p-1 rounded hover:bg-muted text-muted-foreground" onClick={onRefresh} data-testid="button-refresh-preview">
+              <RefreshCw className="w-3 h-3" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>Refresh</TooltipContent>
+        </Tooltip>
+
+        <div className="flex-1 mx-1">
+          <div className="relative">
+            <input
+              value={previewPath}
+              onChange={e => setPreviewPath(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") onRefresh(); }}
+              className="w-full bg-muted/60 rounded text-[11px] text-muted-foreground px-2 py-1 font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
+              data-testid="input-preview-url"
+            />
+          </div>
+        </div>
+
+        <div className="flex items-center gap-0.5 border-l pl-1.5 shrink-0">
+          {VIEWPORT_MODES.map(vm => (
+            <Tooltip key={vm.id}>
+              <TooltipTrigger asChild>
+                <button
+                  className={`p-1 rounded transition-colors ${viewportMode === vm.id ? "bg-primary/15 text-primary" : "text-muted-foreground hover:bg-muted"}`}
+                  onClick={() => setViewportMode(vm.id as typeof viewportMode)}
+                  data-testid={`button-viewport-${vm.id}`}
+                >
+                  <vm.icon className="w-3 h-3" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>{vm.label}</TooltipContent>
+            </Tooltip>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-0.5 border-l pl-1.5 shrink-0">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                className={`p-1 rounded transition-colors ${autoReloadEnabled ? "bg-green-500/15 text-green-500" : "text-muted-foreground hover:bg-muted"}`}
+                onClick={onToggleAutoReload}
+                data-testid="button-toggle-autoreload"
+              >
+                <RefreshCw className="w-3 h-3" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{autoReloadEnabled ? "Auto-reload ON" : "Auto-reload OFF"}</TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button className="p-1 rounded hover:bg-muted text-muted-foreground disabled:opacity-50" onClick={onRestart} disabled={isRestarting} data-testid="button-restart-server">
+                {isRestarting ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Restart Server</TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button className="p-1 rounded hover:bg-muted text-muted-foreground" onClick={onOpenLogs} data-testid="button-view-logs">
+                <ScrollText className="w-3 h-3" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>View Logs</TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button className="p-1 rounded hover:bg-muted text-muted-foreground" onClick={() => window.open(`/api/projects/${projectId}/proxy/`, "_blank")} data-testid="button-open-preview">
+                <ExternalLink className="w-3 h-3" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Open External</TooltipContent>
+          </Tooltip>
+        </div>
+      </div>
+
+      <div className="flex-1 relative flex items-start justify-center overflow-auto bg-muted/20">
+        {isRestarting && (
+          <div className="absolute inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-10">
+            <div className="flex flex-col items-center gap-3">
+              <Loader2 className="w-8 h-8 animate-spin text-primary" />
+              <p className="text-sm text-muted-foreground">Restarting server...</p>
+            </div>
+          </div>
+        )}
+        <iframe
+          ref={iframeRef}
+          key={previewKey}
+          src={isAppRunning ? currentSrc : `/api/projects/${projectId}/preview`}
+          className="h-full border-0 bg-white transition-all"
+          style={{ width: VIEWPORT_MODES.find(v => v.id === viewportMode)?.width || "100%", maxWidth: "100%" }}
+          title="App Preview"
+          data-testid="iframe-preview"
+        />
+      </div>
+    </div>
+  );
+}
+
+function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg max-h-[80vh] overflow-hidden flex flex-col" data-testid="keyboard-shortcuts-dialog">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <KeyRound className="w-5 h-5" />
+            Keyboard Shortcuts
+          </DialogTitle>
+          <DialogDescription>
+            Available keyboard shortcuts for the workspace
+          </DialogDescription>
+        </DialogHeader>
+        <ScrollArea className="flex-1 -mx-6 px-6">
+          <div className="space-y-6 pb-2">
+            {SHORTCUT_GROUPS.map((group) => (
+              <div key={group.category}>
+                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+                  {group.category}
+                </h4>
+                <div className="space-y-1">
+                  {group.shortcuts.map((shortcut, i) => (
+                    <div
+                      key={i}
+                      className="flex items-center justify-between py-1.5 px-2 rounded hover:bg-muted/50 transition-colors"
+                    >
+                      <span className="text-sm">{shortcut.description}</span>
+                      <div className="flex items-center gap-1 shrink-0 ml-4">
+                        {shortcut.keys.map((key, ki) => (
+                          <kbd
+                            key={ki}
+                            className="inline-flex items-center justify-center min-w-[24px] h-6 px-1.5 rounded border bg-muted text-[11px] font-mono font-medium text-muted-foreground shadow-sm"
+                          >
+                            {key}
+                          </kbd>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </ScrollArea>
+      </DialogContent>
+    </Dialog>
   );
 }

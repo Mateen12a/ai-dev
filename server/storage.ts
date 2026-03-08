@@ -6,10 +6,43 @@ import {
   type Deployment, type InsertDeployment,
   type ProjectSecret, type InsertSecret,
   type GitCommit, type InsertGitCommit,
-  projects, projectFiles, aiMessages, buildLogs, deployments, projectSecrets, gitCommits,
+  type FileVersion, type InsertFileVersion,
+  projects, projectFiles, aiMessages, buildLogs, deployments, projectSecrets, gitCommits, fileVersions,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, and } from "drizzle-orm";
+import crypto from "crypto";
+
+const ENCRYPTION_ALGORITHM = "aes-256-gcm";
+const IV_LENGTH = 12;
+const AUTH_TAG_LENGTH = 16;
+
+function getEncryptionKey(): Buffer {
+  const keySource = process.env.SECRETS_ENCRYPTION_KEY || "sudoai-default-encryption-key-32b!";
+  return crypto.scryptSync(keySource, "sudoai-salt", 32);
+}
+
+function encryptValue(plaintext: string): string {
+  const key = getEncryptionKey();
+  const iv = crypto.randomBytes(IV_LENGTH);
+  const cipher = crypto.createCipheriv(ENCRYPTION_ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH });
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  const combined = Buffer.concat([iv, authTag, encrypted]);
+  return "enc:" + combined.toString("base64");
+}
+
+function decryptValue(stored: string): string {
+  if (!stored.startsWith("enc:")) return stored;
+  const key = getEncryptionKey();
+  const combined = Buffer.from(stored.slice(4), "base64");
+  const iv = combined.subarray(0, IV_LENGTH);
+  const authTag = combined.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH);
+  const encrypted = combined.subarray(IV_LENGTH + AUTH_TAG_LENGTH);
+  const decipher = crypto.createDecipheriv(ENCRYPTION_ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH });
+  decipher.setAuthTag(authTag);
+  return decipher.update(encrypted) + decipher.final("utf8");
+}
 
 export interface IStorage {
   getProjects(): Promise<Project[]>;
@@ -44,6 +77,10 @@ export interface IStorage {
 
   getGitCommits(projectId: string): Promise<GitCommit[]>;
   createGitCommit(commit: InsertGitCommit): Promise<GitCommit>;
+
+  getFileVersions(fileId: string, projectId: string): Promise<FileVersion[]>;
+  getFileVersion(versionId: string): Promise<FileVersion | undefined>;
+  createFileVersion(version: InsertFileVersion): Promise<FileVersion>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -145,17 +182,22 @@ export class DatabaseStorage implements IStorage {
   }
 
   async getSecrets(projectId: string): Promise<ProjectSecret[]> {
-    return db.select().from(projectSecrets).where(eq(projectSecrets.projectId, projectId)).orderBy(projectSecrets.createdAt);
+    const rows = await db.select().from(projectSecrets).where(eq(projectSecrets.projectId, projectId)).orderBy(projectSecrets.createdAt);
+    return rows.map(s => ({ ...s, value: decryptValue(s.value) }));
   }
 
   async createSecret(data: InsertSecret): Promise<ProjectSecret> {
-    const [s] = await db.insert(projectSecrets).values(data).returning();
-    return s;
+    const plainValue = data.value || "";
+    const encrypted = { ...data, value: encryptValue(plainValue) };
+    const [s] = await db.insert(projectSecrets).values(encrypted).returning();
+    return { ...s, value: plainValue };
   }
 
   async updateSecret(id: string, value: string): Promise<ProjectSecret | undefined> {
-    const [s] = await db.update(projectSecrets).set({ value }).where(eq(projectSecrets.id, id)).returning();
-    return s;
+    const encrypted = encryptValue(value);
+    const [s] = await db.update(projectSecrets).set({ value: encrypted }).where(eq(projectSecrets.id, id)).returning();
+    if (!s) return undefined;
+    return { ...s, value };
   }
 
   async deleteSecret(id: string): Promise<void> {
@@ -169,6 +211,22 @@ export class DatabaseStorage implements IStorage {
   async createGitCommit(data: InsertGitCommit): Promise<GitCommit> {
     const [c] = await db.insert(gitCommits).values(data).returning();
     return c;
+  }
+
+  async getFileVersions(fileId: string, projectId: string): Promise<FileVersion[]> {
+    return db.select().from(fileVersions)
+      .where(and(eq(fileVersions.fileId, fileId), eq(fileVersions.projectId, projectId)))
+      .orderBy(desc(fileVersions.createdAt));
+  }
+
+  async getFileVersion(versionId: string): Promise<FileVersion | undefined> {
+    const [v] = await db.select().from(fileVersions).where(eq(fileVersions.id, versionId));
+    return v;
+  }
+
+  async createFileVersion(data: InsertFileVersion): Promise<FileVersion> {
+    const [v] = await db.insert(fileVersions).values(data).returning();
+    return v;
   }
 }
 

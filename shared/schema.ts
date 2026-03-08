@@ -46,6 +46,7 @@ export const buildLogs = pgTable("build_logs", {
   type: text("type").notNull().default("info"),
   message: text("message").notNull(),
   stage: text("stage").notNull().default("console"),
+  processLabel: text("process_label").default("main"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
@@ -76,6 +77,16 @@ export const gitCommits = pgTable("git_commits", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
+export const fileVersions = pgTable("file_versions", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  fileId: varchar("file_id").notNull(),
+  projectId: varchar("project_id").notNull(),
+  content: text("content").notNull(),
+  path: text("path").notNull(),
+  size: text("size").notNull().default("0"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
 export const insertUserSchema = createInsertSchema(users).pick({ username: true, password: true });
 export const insertProjectSchema = createInsertSchema(projects).omit({ id: true, createdAt: true });
 export const insertFileSchema = createInsertSchema(projectFiles).omit({ id: true });
@@ -84,6 +95,7 @@ export const insertBuildLogSchema = createInsertSchema(buildLogs).omit({ id: tru
 export const insertDeploymentSchema = createInsertSchema(deployments).omit({ id: true, createdAt: true });
 export const insertSecretSchema = createInsertSchema(projectSecrets).omit({ id: true, createdAt: true });
 export const insertGitCommitSchema = createInsertSchema(gitCommits).omit({ id: true, createdAt: true });
+export const insertFileVersionSchema = createInsertSchema(fileVersions).omit({ id: true, createdAt: true });
 
 export type InsertUser = z.infer<typeof insertUserSchema>;
 export type User = typeof users.$inferSelect;
@@ -101,3 +113,5 @@ export type InsertSecret = z.infer<typeof insertSecretSchema>;
 export type ProjectSecret = typeof projectSecrets.$inferSelect;
 export type InsertGitCommit = z.infer<typeof insertGitCommitSchema>;
 export type GitCommit = typeof gitCommits.$inferSelect;
+export type InsertFileVersion = z.infer<typeof insertFileVersionSchema>;
+export type FileVersion = typeof fileVersions.$inferSelect;

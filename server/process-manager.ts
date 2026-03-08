@@ -9,12 +9,32 @@ export interface RunningProcess {
   status: "starting" | "running" | "crashed" | "stopped";
   startedAt: Date;
   command: string;
+  label: string;
+  restartCount: number;
 }
 
 const running = new Map<string, RunningProcess>();
 
-export function getProcess(projectId: string): RunningProcess | undefined {
-  return running.get(projectId);
+function processKey(projectId: string, label: string): string {
+  return `${projectId}:${label}`;
+}
+
+export function getProcess(projectId: string, label?: string): RunningProcess | undefined {
+  if (label) {
+    return running.get(processKey(projectId, label));
+  }
+  for (const [key, proc] of running) {
+    if (key.startsWith(`${projectId}:`)) return proc;
+  }
+  return undefined;
+}
+
+export function getProcesses(projectId: string): RunningProcess[] {
+  const result: RunningProcess[] = [];
+  for (const [key, proc] of running) {
+    if (key.startsWith(`${projectId}:`)) result.push(proc);
+  }
+  return result;
 }
 
 export function getAllRunning(): Map<string, RunningProcess> {
@@ -44,13 +64,17 @@ export async function startProcess(
   command: string,
   env: Record<string, string> = {},
   onLog: (msg: string, type: string) => void,
-  customCwd?: string
+  customCwd?: string,
+  label: string = "main"
 ): Promise<{ success: boolean; message: string }> {
-  await killProcess(projectId);
+  await killProcess(projectId, label);
 
   const cwd = customCwd || env.PWD || path.join(BASE_DIR, projectId);
   const cleanEnv = { ...env };
   delete cleanEnv.PWD;
+
+  const existingProc = getProcess(projectId, label);
+  const restartCount = existingProc ? existingProc.restartCount + 1 : 0;
 
   const proc: RunningProcess = {
     child: null as any,
@@ -58,6 +82,8 @@ export async function startProcess(
     status: "starting",
     startedAt: new Date(),
     command,
+    label,
+    restartCount,
   };
 
   const child = spawn(command, [], {
@@ -74,7 +100,8 @@ export async function startProcess(
   });
 
   proc.child = child;
-  running.set(projectId, proc);
+  const key = processKey(projectId, label);
+  running.set(key, proc);
 
   const handleChunk = (data: Buffer, isStderr = false) => {
     const text = data.toString();
@@ -100,12 +127,12 @@ export async function startProcess(
 
   child.on("error", (err) => {
     proc.status = "crashed";
-    running.delete(projectId);
+    running.delete(key);
     onLog(`Failed to start: ${err.message}`, "error");
   });
 
   child.on("exit", (code, signal) => {
-    running.delete(projectId);
+    running.delete(key);
     if (signal === "SIGTERM" || signal === "SIGKILL") {
       onLog("Process stopped.", "system");
     } else {
@@ -116,19 +143,28 @@ export async function startProcess(
   return { success: true, message: `Started: ${command}` };
 }
 
-export function killProcess(projectId: string): Promise<void> {
+export function killProcess(projectId: string, label?: string): Promise<void> {
+  if (label) {
+    return killSingleProcess(processKey(projectId, label));
+  }
+  const keys = [...running.keys()].filter(k => k.startsWith(`${projectId}:`));
+  return Promise.all(keys.map(k => killSingleProcess(k))).then(() => {});
+}
+
+function killSingleProcess(key: string): Promise<void> {
   return new Promise(resolve => {
-    const proc = running.get(projectId);
+    const proc = running.get(key);
     if (!proc) return resolve();
 
-    running.delete(projectId);
+    proc.status = "stopped";
+    running.delete(key);
 
     try {
       proc.child.kill("SIGTERM");
       const t = setTimeout(() => {
         try { proc.child.kill("SIGKILL"); } catch (_) {}
         resolve();
-      }, 2000);
+      }, 3000);
       proc.child.on("exit", () => { clearTimeout(t); resolve(); });
     } catch (_) {
       resolve();
@@ -136,7 +172,33 @@ export function killProcess(projectId: string): Promise<void> {
   });
 }
 
-/** Return the shallowest package.json file from a list (fewest path segments). */
+export async function restartProcess(
+  projectId: string,
+  label: string,
+  env: Record<string, string> = {},
+  onLog: (msg: string, type: string) => void,
+  customCwd?: string
+): Promise<{ success: boolean; message: string }> {
+  const key = processKey(projectId, label);
+  const existing = running.get(key);
+  if (!existing) {
+    return { success: false, message: `No process found with label '${label}'` };
+  }
+  const command = existing.command;
+  const restartCount = existing.restartCount + 1;
+
+  await killProcess(projectId, label);
+
+  const result = await startProcess(projectId, command, env, onLog, customCwd, label);
+
+  const newProc = running.get(key);
+  if (newProc) {
+    newProc.restartCount = restartCount;
+  }
+
+  return result;
+}
+
 function shallowestPkg(
   files: Array<{ path: string; name: string; content?: string }>
 ): { path: string; name: string; content?: string } | undefined {
@@ -191,9 +253,6 @@ export function detectStartCommand(
   return "npm start";
 }
 
-/** Returns install commands for all package.json directories, shallowest first.
- *  Skips a nested dir if the parent already runs concurrent installs via postinstall.
- */
 export function detectInstallCommands(
   files: Array<{ path: string; name: string }>,
   projectRootDir: string
@@ -210,16 +269,13 @@ export function detectInstallCommands(
     return [];
   }
 
-  // Always install the root (shallowest) first
   cmds.push("npm install");
 
-  // Also install immediate sub-directories that have their own package.json
   const rootDepth = pkgFiles[0].path.split("/").length;
   for (const pf of pkgFiles.slice(1)) {
     const depth = pf.path.split("/").length;
     if (depth === rootDepth + 1) {
       const subDir = pf.path.split("/").slice(0, -1).join("/");
-      // Get relative subDir within the workingDir (strip the workingDir prefix)
       const rootParts = pkgFiles[0].path.split("/").slice(0, -1);
       const subParts = pf.path.split("/").slice(0, -1);
       const rel = subParts.slice(rootParts.length).join("/");
@@ -230,7 +286,140 @@ export function detectInstallCommands(
   return cmds;
 }
 
-/** Legacy single-command version (used by shell panel directly). */
+export interface DetectedRuntime {
+  language: string;
+  framework: string;
+  version: string | null;
+  runCommand: string;
+  installCommand: string | null;
+  entryPoint: string | null;
+  icon: string;
+}
+
+export function detectProjectRuntime(
+  files: Array<{ path: string; name: string; content?: string }>
+): DetectedRuntime {
+  const hasFile = (name: string) => files.some(f => f.name === name || f.path === name || f.path.endsWith(`/${name}`));
+  const getFileContent = (name: string) => files.find(f => f.name === name || f.path === name || f.path.endsWith(`/${name}`))?.content;
+
+  if (hasFile("Cargo.toml")) {
+    const content = getFileContent("Cargo.toml") || "";
+    const nameMatch = content.match(/name\s*=\s*"([^"]+)"/);
+    const editionMatch = content.match(/edition\s*=\s*"([^"]+)"/);
+    return {
+      language: "rust",
+      framework: nameMatch ? nameMatch[1] : "rust",
+      version: editionMatch ? `Edition ${editionMatch[1]}` : null,
+      runCommand: "cargo run",
+      installCommand: "cargo build",
+      entryPoint: "src/main.rs",
+      icon: "🦀",
+    };
+  }
+
+  if (hasFile("go.mod")) {
+    const content = getFileContent("go.mod") || "";
+    const goVersionMatch = content.match(/^go\s+(\S+)/m);
+    const moduleMatch = content.match(/^module\s+(\S+)/m);
+    return {
+      language: "go",
+      framework: moduleMatch ? moduleMatch[1].split("/").pop() || "go" : "go",
+      version: goVersionMatch ? `Go ${goVersionMatch[1]}` : null,
+      runCommand: "go run .",
+      installCommand: "go mod download",
+      entryPoint: "main.go",
+      icon: "🐹",
+    };
+  }
+
+  if (hasFile("requirements.txt") || hasFile("setup.py") || hasFile("pyproject.toml") || hasFile("Pipfile")) {
+    let framework = "python";
+    let runCommand = "python3 main.py";
+    let entryPoint = "main.py";
+
+    const reqContent = getFileContent("requirements.txt") || "";
+    const pyprojectContent = getFileContent("pyproject.toml") || "";
+    const allPyContent = reqContent + " " + pyprojectContent;
+
+    if (/fastapi/i.test(allPyContent)) {
+      framework = "fastapi";
+      runCommand = "python3 -m uvicorn main:app --host 0.0.0.0 --port 3000 --reload";
+    } else if (/flask/i.test(allPyContent)) {
+      framework = "flask";
+      runCommand = "python3 -m flask run --host 0.0.0.0 --port 3000";
+      entryPoint = "app.py";
+    } else if (/django/i.test(allPyContent)) {
+      framework = "django";
+      runCommand = "python3 manage.py runserver 0.0.0.0:3000";
+      entryPoint = "manage.py";
+    } else if (/streamlit/i.test(allPyContent)) {
+      framework = "streamlit";
+      runCommand = "python3 -m streamlit run main.py --server.port 3000 --server.address 0.0.0.0";
+    }
+
+    if (hasFile("app.py") && framework === "python") entryPoint = "app.py";
+
+    let installCommand: string | null = "pip install -r requirements.txt";
+    if (hasFile("Pipfile")) installCommand = "pipenv install";
+    else if (hasFile("pyproject.toml") && !hasFile("requirements.txt")) installCommand = "pip install -e .";
+
+    return { language: "python", framework, version: null, runCommand, installCommand, entryPoint, icon: "🐍" };
+  }
+
+  if (hasFile("package.json")) {
+    const content = getFileContent("package.json") || "{}";
+    let framework = "node";
+    let version: string | null = null;
+    let runCommand = "npm start";
+    let entryPoint: string | null = null;
+
+    try {
+      const pkg = JSON.parse(content);
+      const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+
+      if (allDeps["next"]) framework = "nextjs";
+      else if (allDeps["nuxt"]) framework = "nuxt";
+      else if (allDeps["@angular/core"]) framework = "angular";
+      else if (allDeps["vue"]) framework = "vue";
+      else if (allDeps["svelte"]) framework = "svelte";
+      else if (allDeps["react"]) framework = "react";
+      else if (allDeps["express"]) framework = "express";
+      else if (allDeps["fastify"]) framework = "fastify";
+      else if (allDeps["hono"]) framework = "hono";
+      else if (allDeps["koa"]) framework = "koa";
+
+      if (pkg.scripts?.dev) runCommand = "npm run dev";
+      else if (pkg.scripts?.start) runCommand = "npm start";
+
+      if (pkg.main) entryPoint = pkg.main;
+      version = pkg.engines?.node ? `Node ${pkg.engines.node}` : null;
+    } catch (_) {}
+
+    const hasTsFiles = files.some(f => f.name.endsWith(".ts") || f.name.endsWith(".tsx"));
+    const language = hasTsFiles ? "typescript" : "javascript";
+
+    return { language, framework, version, runCommand, installCommand: "npm install", entryPoint, icon: language === "typescript" ? "🔷" : "🟨" };
+  }
+
+  if (hasFile("Gemfile")) {
+    return { language: "ruby", framework: "ruby", version: null, runCommand: "ruby main.rb", installCommand: "bundle install", entryPoint: "main.rb", icon: "💎" };
+  }
+
+  if (hasFile("pom.xml") || hasFile("build.gradle")) {
+    return {
+      language: "java",
+      framework: hasFile("pom.xml") ? "maven" : "gradle",
+      version: null,
+      runCommand: hasFile("pom.xml") ? "mvn spring-boot:run" : "./gradlew bootRun",
+      installCommand: hasFile("pom.xml") ? "mvn install" : "./gradlew build",
+      entryPoint: null,
+      icon: "☕",
+    };
+  }
+
+  return { language: "unknown", framework: "unknown", version: null, runCommand: "echo 'No run command detected'", installCommand: null, entryPoint: null, icon: "📄" };
+}
+
 export function detectInstallCommand(
   files: Array<{ path: string; name: string }>
 ): string | null {

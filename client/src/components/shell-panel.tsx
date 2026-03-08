@@ -1,13 +1,11 @@
-import { useState, useRef, useEffect } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { apiRequest } from "@/lib/queryClient";
-import { Loader2, Play, Terminal } from "lucide-react";
+import { useEffect, useRef, useCallback, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Play, Terminal, RotateCcw } from "lucide-react";
 import type { Project, ProjectFile } from "@shared/schema";
-
-interface ShellLine {
-  type: "input" | "output" | "error" | "info" | "banner";
-  text: string;
-}
+import { Terminal as XTerm } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import "@xterm/xterm/css/xterm.css";
 
 interface ShellPanelProps {
   projectId: string;
@@ -59,215 +57,202 @@ function detectInstallCommand(files: ProjectFile[]): string | null {
 }
 
 export default function ShellPanel({ projectId, project }: ShellPanelProps) {
-  const [lines, setLines] = useState<ShellLine[]>([]);
-  const [input, setInput] = useState("");
-  const [cwd, setCwd] = useState(`/tmp/devforge-projects/${projectId}`);
-  const [history, setHistory] = useState<string[]>([]);
-  const [historyIndex, setHistoryIndex] = useState(-1);
-  const [initialized, setInitialized] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const termRef = useRef<HTMLDivElement>(null);
+  const xtermRef = useRef<XTerm | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const [connected, setConnected] = useState(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const { data: files = [] } = useQuery<ProjectFile[]>({
     queryKey: ["/api/projects", projectId, "files"],
   });
 
-  // Initialize shell with project context banner
+  const connect = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${window.location.host}/ws/terminal?projectId=${projectId}`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setConnected(true);
+      if (fitAddonRef.current) {
+        try { fitAddonRef.current.fit(); } catch (_) {}
+      }
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "output" && xtermRef.current) {
+          xtermRef.current.write(msg.data);
+        } else if (msg.type === "exit") {
+          xtermRef.current?.write("\r\n\x1b[1;33m[Process exited]\x1b[0m\r\n");
+          setConnected(false);
+        }
+      } catch (_) {}
+    };
+
+    ws.onclose = () => {
+      setConnected(false);
+      reconnectTimerRef.current = setTimeout(() => {
+        if (termRef.current) connect();
+      }, 2000);
+    };
+
+    ws.onerror = () => {
+      setConnected(false);
+    };
+  }, [projectId]);
+
   useEffect(() => {
-    if (!initialized && project && files.length > 0) {
-      setInitialized(true);
-      const startCmd = detectStartCommand(project, files);
-      const installCmd = detectInstallCommand(files);
+    if (!termRef.current) return;
 
-      const bannerLines: ShellLine[] = [
-        { type: "info", text: `SudoAI Shell — ${project.name}` },
-        { type: "info", text: `Directory: /tmp/devforge-projects/${projectId}` },
-        { type: "info", text: "" },
-      ];
+    const term = new XTerm({
+      cursorBlink: true,
+      cursorStyle: "bar",
+      fontSize: 13,
+      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, Monaco, 'Courier New', monospace",
+      lineHeight: 1.4,
+      scrollback: 5000,
+      allowTransparency: true,
+      theme: {
+        background: "#0d1117",
+        foreground: "#e6edf3",
+        cursor: "#58a6ff",
+        cursorAccent: "#0d1117",
+        selectionBackground: "#264f78",
+        selectionForeground: "#e6edf3",
+        black: "#484f58",
+        red: "#ff7b72",
+        green: "#3fb950",
+        yellow: "#d29922",
+        blue: "#58a6ff",
+        magenta: "#bc8cff",
+        cyan: "#39d2c0",
+        white: "#e6edf3",
+        brightBlack: "#6e7681",
+        brightRed: "#ffa198",
+        brightGreen: "#56d364",
+        brightYellow: "#e3b341",
+        brightBlue: "#79c0ff",
+        brightMagenta: "#d2a8ff",
+        brightCyan: "#56d4dd",
+        brightWhite: "#f0f6fc",
+      },
+    });
 
-      if (installCmd) {
-        bannerLines.push({ type: "info", text: `┌─ Install deps:  ${installCmd}` });
-      }
-      if (startCmd) {
-        bannerLines.push({ type: "info", text: `├─ Start app:     ${startCmd.label}` });
-        bannerLines.push({ type: "info", text: `└─ Or click ▶ Run App above` });
-      }
-      if (!startCmd) {
-        bannerLines.push({ type: "info", text: `Type 'help' for available commands` });
-      }
-      bannerLines.push({ type: "info", text: "" });
+    const fitAddon = new FitAddon();
+    const webLinksAddon = new WebLinksAddon();
 
-      setLines(bannerLines);
+    term.loadAddon(fitAddon);
+    term.loadAddon(webLinksAddon);
+    term.open(termRef.current);
+
+    xtermRef.current = term;
+    fitAddonRef.current = fitAddon;
+
+    setTimeout(() => {
+      try { fitAddon.fit(); } catch (_) {}
+    }, 50);
+
+    term.onData((data) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "input", data }));
+      }
+    });
+
+    term.onResize(({ cols, rows }) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "resize", cols, rows }));
+      }
+    });
+
+    connect();
+
+    const resizeObserver = new ResizeObserver(() => {
+      try { fitAddon.fit(); } catch (_) {}
+    });
+    resizeObserver.observe(termRef.current);
+
+    return () => {
+      resizeObserver.disconnect();
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      wsRef.current?.close();
+      term.dispose();
+    };
+  }, [connect]);
+
+  const sendCommand = useCallback((cmd: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "input", data: cmd + "\n" }));
     }
-  }, [initialized, project, files, projectId]);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [lines]);
-
-  const execMutation = useMutation({
-    mutationFn: async (command: string) => {
-      const res = await apiRequest("POST", `/api/projects/${projectId}/shell`, { command, cwd });
-      return res.json();
-    },
-    onSuccess: (result) => {
-      const output: ShellLine[] = [];
-      if (result.stdout) output.push({ type: "output", text: result.stdout });
-      if (result.stderr) output.push({ type: "error", text: result.stderr });
-      if (!result.stdout && !result.stderr) output.push({ type: "output", text: "" });
-      if (result.cwd) setCwd(result.cwd);
-      setLines(prev => [...prev, ...output]);
-    },
-    onError: (err: Error) => {
-      setLines(prev => [...prev, { type: "error", text: `Error: ${err.message}` }]);
-    },
-  });
-
-  const runCommand = (cmd: string) => {
-    setLines(prev => [...prev, { type: "input", text: `$ ${cmd}` }]);
-    setHistory(prev => [cmd, ...prev.slice(0, 49)]);
-    setHistoryIndex(-1);
-    execMutation.mutate(cmd);
-  };
-
-  const runCommandRef = useRef(runCommand);
-  runCommandRef.current = runCommand;
+  }, []);
 
   useEffect(() => {
     const handler = (e: Event) => {
       const dir = (e as CustomEvent).detail as string;
       const fullPath = dir.startsWith("/") ? dir : `/tmp/devforge-projects/${projectId}/${dir}`;
-      runCommandRef.current(`cd "${fullPath}"`);
-      inputRef.current?.focus();
+      sendCommand(`cd "${fullPath}"`);
     };
     window.addEventListener("shell:cd", handler);
     return () => window.removeEventListener("shell:cd", handler);
-  }, [projectId]);
+  }, [projectId, sendCommand]);
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" && input.trim()) {
-      const cmd = input.trim();
-      setInput("");
-
-      if (cmd === "clear") {
-        setLines([{ type: "info", text: "" }]);
-        return;
-      }
-      if (cmd === "help") {
-        setLines(prev => [
-          ...prev,
-          { type: "output", text: "Available commands:" },
-          { type: "output", text: "  ls, cat, pwd, echo, node, python3, git, npm, curl, env" },
-          { type: "output", text: "  clear — clear terminal  |  Ctrl+L — clear" },
-        ]);
-        return;
-      }
-
-      runCommand(cmd);
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      if (history.length > 0) {
-        const idx = Math.min(historyIndex + 1, history.length - 1);
-        setHistoryIndex(idx);
-        setInput(history[idx]);
-      }
-    } else if (e.key === "ArrowDown") {
-      e.preventDefault();
-      if (historyIndex > 0) {
-        const idx = historyIndex - 1;
-        setHistoryIndex(idx);
-        setInput(history[idx]);
-      } else {
-        setHistoryIndex(-1);
-        setInput("");
-      }
-    } else if (e.key === "l" && e.ctrlKey) {
-      e.preventDefault();
-      setLines([{ type: "info", text: "" }]);
-    }
+  const handleReconnect = () => {
+    wsRef.current?.close();
+    xtermRef.current?.clear();
+    setTimeout(connect, 100);
   };
 
   const startCmd = project && files.length > 0 ? detectStartCommand(project, files) : null;
   const installCmd = files.length > 0 ? detectInstallCommand(files) : null;
-  const promptPath = cwd.replace(`/tmp/devforge-projects/${projectId}`, "~");
 
   return (
-    <div
-      className="h-full flex flex-col bg-[#0d1117] font-mono text-sm"
-      onClick={() => inputRef.current?.focus()}
-      data-testid="panel-shell"
-    >
-      {/* Quick action buttons */}
-      {(startCmd || installCmd) && (
-        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#30363d] bg-[#161b22] shrink-0">
-          {installCmd && (
-            <button
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[10px] font-sans bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#e6edf3] hover:border-[#58a6ff] transition-colors"
-              onClick={() => runCommand(installCmd)}
-              disabled={execMutation.isPending}
-              data-testid="button-shell-install"
-            >
-              <Terminal className="w-3 h-3" />
-              Install
-            </button>
-          )}
-          {startCmd && (
-            <button
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[10px] font-sans bg-[#238636] border border-[#2ea043] text-white hover:bg-[#2ea043] transition-colors"
-              onClick={() => runCommand(startCmd.cmd)}
-              disabled={execMutation.isPending}
-              data-testid="button-shell-run-app"
-            >
-              <Play className="w-3 h-3" />
-              Run App
-            </button>
-          )}
-          <span className="text-[10px] text-[#484f58] font-sans ml-auto">{project?.language}/{project?.framework}</span>
-        </div>
-      )}
-
-      <div className="flex-1 overflow-y-auto px-3 py-2 space-y-0.5">
-        {lines.map((line, i) => (
-          <div
-            key={i}
-            className={
-              line.type === "input" ? "text-[#58a6ff]" :
-              line.type === "error" ? "text-[#f85149]" :
-              line.type === "info" ? "text-[#8b949e]" :
-              line.type === "banner" ? "text-[#3fb950]" :
-              "text-[#e6edf3]"
-            }
-            style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", lineHeight: "1.5" }}
+    <div className="h-full flex flex-col bg-[#0d1117]" data-testid="panel-shell">
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#30363d] bg-[#161b22] shrink-0">
+        {installCmd && (
+          <button
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[10px] font-sans bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#e6edf3] hover:border-[#58a6ff] transition-colors"
+            onClick={() => sendCommand(installCmd)}
+            data-testid="button-shell-install"
           >
-            {line.text}
-          </div>
-        ))}
-        {execMutation.isPending && (
-          <div className="flex items-center gap-2 text-[#8b949e]">
-            <Loader2 className="w-3 h-3 animate-spin" />
-            <span>running...</span>
-          </div>
+            <Terminal className="w-3 h-3" />
+            Install
+          </button>
         )}
-        <div ref={bottomRef} />
+        {startCmd && (
+          <button
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[10px] font-sans bg-[#238636] border border-[#2ea043] text-white hover:bg-[#2ea043] transition-colors"
+            onClick={() => sendCommand(startCmd.cmd)}
+            data-testid="button-shell-run-app"
+          >
+            <Play className="w-3 h-3" />
+            Run App
+          </button>
+        )}
+        <div className="flex items-center gap-2 ml-auto">
+          <span className={`w-1.5 h-1.5 rounded-full ${connected ? "bg-[#3fb950]" : "bg-[#f85149]"}`} />
+          <span className="text-[10px] text-[#484f58] font-sans">
+            {connected ? "Connected" : "Disconnected"}
+          </span>
+          <button
+            className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-sans text-[#8b949e] hover:text-[#e6edf3] transition-colors"
+            onClick={handleReconnect}
+            title="Reconnect terminal"
+          >
+            <RotateCcw className="w-3 h-3" />
+          </button>
+        </div>
       </div>
 
-      <div className="border-t border-[#30363d] px-3 py-2 flex items-center gap-2">
-        <span className="text-[#3fb950] select-none text-xs">{promptPath}</span>
-        <span className="text-[#e6edf3] select-none">$</span>
-        <input
-          ref={inputRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          className="flex-1 bg-transparent outline-none text-[#e6edf3] placeholder:text-[#484f58] text-sm"
-          placeholder="type a command..."
-          autoComplete="off"
-          spellCheck={false}
-          data-testid="input-shell-command"
-          disabled={execMutation.isPending}
-        />
-        {execMutation.isPending && <Loader2 className="w-3 h-3 animate-spin text-[#8b949e] shrink-0" />}
-      </div>
+      <div
+        ref={termRef}
+        className="flex-1 overflow-hidden px-1 py-1"
+        onClick={() => xtermRef.current?.focus()}
+      />
     </div>
   );
 }

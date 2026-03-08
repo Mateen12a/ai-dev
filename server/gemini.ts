@@ -10,6 +10,49 @@ function getClient() {
   return genAI;
 }
 
+export type AgentMode = "lite" | "economy" | "power" | "agent" | "max" | "test" | "optimize";
+
+// ─────────────────────────────────────────────
+// AUTO MODEL SELECTION
+// Flash = fast/cheap, Pro = deep/complex, Thinking = analysis-heavy
+// ─────────────────────────────────────────────
+const MODELS = {
+  flash: "gemini-2.0-flash",
+  pro: "gemini-1.5-pro",
+  thinking: "gemini-2.0-flash-thinking-exp-01-21",
+} as const;
+
+export function selectModelForMode(
+  mode: AgentMode,
+  complexity?: "simple" | "moderate" | "complex" | "very_complex"
+): { model: string; label: string } {
+  switch (mode) {
+    case "lite":
+      return { model: MODELS.flash, label: "Flash" };
+    case "economy":
+      return { model: MODELS.flash, label: "Flash" };
+    case "power":
+      if (complexity === "very_complex" || complexity === "complex") {
+        return { model: MODELS.pro, label: "Pro" };
+      }
+      return { model: MODELS.flash, label: "Flash" };
+    case "agent":
+      return { model: MODELS.flash, label: "Flash" };
+    case "max":
+      return { model: MODELS.pro, label: "Pro" };
+    case "test":
+      return { model: MODELS.thinking, label: "Flash Thinking" };
+    case "optimize":
+      return { model: MODELS.pro, label: "Pro" };
+    default:
+      return { model: MODELS.flash, label: "Flash" };
+  }
+}
+
+function stripThinkingTags(text: string): string {
+  return text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "").replace(/^\s*\n/gm, "\n").trim();
+}
+
 function buildDirTree(filePaths: string[]): string {
   const tree: Record<string, any> = {};
   for (const p of filePaths) {
@@ -30,13 +73,43 @@ function buildDirTree(filePaths: string[]): string {
   return render(tree);
 }
 
+async function callModel(modelName: string, parts: any[]): Promise<string> {
+  const client = getClient();
+  if (!client) throw new Error("No Gemini client (missing API key)");
+  try {
+    const model = client.getGenerativeModel({ model: modelName });
+    const result = await model.generateContent(parts);
+    return result.response.text().trim();
+  } catch (err: any) {
+    if (modelName !== MODELS.flash) {
+      console.warn(`[Gemini] Model ${modelName} failed, falling back to flash:`, err.message);
+      const model = client.getGenerativeModel({ model: MODELS.flash });
+      const result = await model.generateContent(parts);
+      return result.response.text().trim();
+    }
+    throw err;
+  }
+}
+
+export async function* callModelStream(modelName: string, parts: any[]): AsyncGenerator<string> {
+  const client = getClient();
+  if (!client) throw new Error("No Gemini client (missing API key)");
+  const model = client.getGenerativeModel({ model: modelName });
+  const result = await model.generateContentStream(parts);
+  for await (const chunk of result.stream) {
+    const text = chunk.text();
+    if (text) yield text;
+  }
+}
+
+// ─────────────────────────────────────────────
+// GENERATE WITH GEMINI (simple one-shot)
+// ─────────────────────────────────────────────
 export async function generateWithGemini(prompt: string, context?: string): Promise<string> {
   const client = getClient();
   if (!client) return fallbackResponse(prompt);
 
   try {
-    const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
-
     const systemContext = `You are SudoAI — an expert AI software engineering assistant embedded in an IDE.
 You help developers write code, fix bugs, explain concepts, and build full applications.
 When asked to generate code, produce clean, production-ready code.
@@ -44,9 +117,7 @@ When modifying files, be specific about what changed and why.
 Keep responses concise but thorough. Use markdown formatting.
 Current project context: ${context || "No project context provided"}`;
 
-    const result = await model.generateContent([systemContext, prompt]);
-    const response = await result.response;
-    return response.text();
+    return await callModel(MODELS.flash, [systemContext, prompt]);
   } catch (err: any) {
     console.error("[Gemini] Error:", err.message);
     if (err.message?.includes("API_KEY") || err.message?.includes("authentication")) {
@@ -56,6 +127,9 @@ Current project context: ${context || "No project context provided"}`;
   }
 }
 
+// ─────────────────────────────────────────────
+// GENERATE PROJECT CODE (initial scaffold)
+// ─────────────────────────────────────────────
 export async function generateProjectCode(
   prompt: string,
   language: string,
@@ -65,9 +139,21 @@ export async function generateProjectCode(
   if (!client) return [];
 
   try {
-    const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const isFullStack = /react|vue|svelte|next|frontend|client.*server|full.?stack|spa|vite/i.test(prompt + " " + framework);
+    const hasBackend = /express|fastify|api|backend|server|rest|graphql/i.test(prompt + " " + framework);
+
+    const fullStackNote = (isFullStack && hasBackend)
+      ? `This is a FULL-STACK project. You MUST generate BOTH:
+1. Frontend files (client/ folder with React/Vite app)
+2. Backend files (server/ folder with Express/Node API)
+Include: client/package.json, client/index.html, client/src/main.tsx, client/src/App.tsx, server/index.ts, server/routes.ts, package.json (root), tsconfig.json`
+      : isFullStack
+        ? `Generate a complete frontend app with all components, styles, and config files.`
+        : `Generate a complete backend API with all routes, middleware, and config files.`;
 
     const sysPrompt = `You are SudoAI, an expert code generator. Generate a complete ${language}/${framework} project based on the user's prompt.
+
+${fullStackNote}
 
 Return ONLY a JSON array with this exact shape (no markdown, no extra text):
 [
@@ -76,21 +162,19 @@ Return ONLY a JSON array with this exact shape (no markdown, no extra text):
 ]
 
 Rules:
-- Include ALL files needed to run the project (package.json, main file, routes, etc.)
-- Make code complete and production-ready, not stubs
-- For ${language}/${framework} projects, include proper configuration files
-- Maximum 8 files to keep it manageable
-- File paths should be relative (no leading slash)`;
+- Include ALL files needed to run the project (package.json, main file, routes, components, etc.)
+- Make code complete and functional, not stubs — real working code
+- Include proper TypeScript config, vite config, or other necessary config files
+- For full-stack: client folder has its own package.json with React/Vite deps; server has its own deps
+- Maximum 12 files total
+- File paths should be relative (no leading slash)
+- All file contents must be complete and syntactically correct`;
 
-    const result = await model.generateContent([sysPrompt, `Build this: ${prompt}`]);
-    const text = result.response.text().trim();
-
+    const text = await callModel(MODELS.flash, [sysPrompt, `Build this: ${prompt}`]);
     const jsonMatch = text.match(/\[[\s\S]*\]/);
     if (!jsonMatch) return [];
-
     const parsed = JSON.parse(jsonMatch[0]);
     if (!Array.isArray(parsed)) return [];
-
     return parsed.filter(f => f.path && f.content);
   } catch (err: any) {
     console.error("[Gemini] Code gen error:", err.message);
@@ -98,6 +182,9 @@ Rules:
   }
 }
 
+// ─────────────────────────────────────────────
+// THINK / PLAN PHASE
+// ─────────────────────────────────────────────
 export async function thinkAgentPlan(
   userMessage: string,
   projectContext: {
@@ -106,18 +193,26 @@ export async function thinkAgentPlan(
     framework: string;
     description: string;
     workingDir?: string;
+    editorContext?: {
+      activeFile: string | null;
+      selection: string | null;
+      cursorLine: number | null;
+    };
   },
   files: Array<{ path: string; content: string }>,
-  conversationHistory: Array<{ role: string; content: string }>
+  conversationHistory: Array<{ role: string; content: string }>,
+  mode: AgentMode = "power"
 ): Promise<{
   thinking: string;
   plan: string[];
+  modelSelected: string;
+  modelLabel: string;
   assessment: {
     confidence: "high" | "medium" | "low";
     canHandle: boolean;
     risks: string[];
     blockers: string[];
-    recommendedMode: "fast" | "power" | "economy" | "autonomy" | null;
+    recommendedMode: AgentMode | null;
     clarificationNeeded: string | null;
     estimatedComplexity: "simple" | "moderate" | "complex" | "very_complex";
   };
@@ -126,6 +221,8 @@ export async function thinkAgentPlan(
   const fallback = {
     thinking: "Analyzing the request...",
     plan: ["Understand the request", "Make the necessary changes", "Validate the result"],
+    modelSelected: MODELS.flash,
+    modelLabel: "Flash",
     assessment: {
       confidence: "medium" as const,
       canHandle: true,
@@ -140,13 +237,9 @@ export async function thinkAgentPlan(
   if (!client) return fallback;
 
   try {
-    const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
-
     const filePaths = files.map(f => f.path);
     const dirTree = buildDirTree(filePaths);
-
     const recentFiles = files.slice(0, 8).map(f => `${f.path} (${f.content.length} chars)`).join("\n");
-
     const historyText = conversationHistory
       .slice(-6)
       .map(m => `${m.role.toUpperCase()}: ${m.content}`)
@@ -158,6 +251,7 @@ Your job is to THINK and PLAN before taking action. Analyze the user's request c
 Project: "${projectContext.name}" (${projectContext.language}/${projectContext.framework})
 ${projectContext.description ? `Description: ${projectContext.description}` : ""}
 ${projectContext.workingDir ? `Working directory: ${projectContext.workingDir}` : ""}
+${projectContext.editorContext?.activeFile ? `Editor Context: The user is currently viewing "${projectContext.editorContext.activeFile}"${projectContext.editorContext.cursorLine ? ` at line ${projectContext.editorContext.cursorLine}` : ""}.${projectContext.editorContext.selection ? ` Selected text: "${projectContext.editorContext.selection.substring(0, 500)}"` : ""}` : ""}
 
 Project structure:
 ${dirTree}
@@ -168,6 +262,7 @@ ${recentFiles}
 ${historyText ? `Recent conversation:\n${historyText}` : ""}
 
 User's request: "${userMessage}"
+Current mode: ${mode.toUpperCase()}
 
 Produce a THINKING PLAN in JSON. Be honest about complexity and limitations.
 
@@ -186,33 +281,39 @@ Return ONLY this JSON:
   }
 }
 
-Rules for assessment:
-- confidence "high": clear task, familiar patterns, straightforward changes
-- confidence "medium": some uncertainty, multiple files, potential side effects
-- confidence "low": unclear requirements, missing context, risky changes
-- canHandle false: truly impossible without external services, credentials, or info you don't have
-- recommendedMode: suggest "autonomy" for complex multi-step tasks that need iteration; "power" for moderate tasks; "fast" for simple tasks; null if current mode is fine
-- clarificationNeeded: a specific question if you need info to proceed; null if clear
-- estimatedComplexity: "simple" (1-2 file changes), "moderate" (3-5 files), "complex" (6+ files, dependencies), "very_complex" (architecture changes, new services)`;
+Mode recommendation rules:
+- "lite": trivial single-line changes, quick questions
+- "economy": small isolated bug fix, one file
+- "power": feature additions, multi-file, 3-5 files
+- "agent": complex multi-step, needs iteration and review (6+ files)
+- "max": very complex architecture, new services, full feature builds (fully autonomous)
+- "test": when user wants tests written or existing tests fixed
+- "optimize": when user wants performance/code quality improvements
+- Set recommendedMode to null if current mode seems appropriate`;
 
-    const result = await model.generateContent(systemPrompt);
-    const text = result.response.text().trim();
-
+    const text = await callModel(MODELS.flash, [systemPrompt]);
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0]);
+        const complexity = parsed.assessment?.estimatedComplexity || "moderate";
+        const recommendedMode = (parsed.assessment?.recommendedMode as AgentMode) || null;
+        const effectiveMode = recommendedMode || mode;
+        const { model: selectedModel, label: modelLabel } = selectModelForMode(effectiveMode, complexity);
+
         return {
           thinking: parsed.thinking || fallback.thinking,
           plan: Array.isArray(parsed.plan) ? parsed.plan : fallback.plan,
+          modelSelected: selectedModel,
+          modelLabel,
           assessment: {
             confidence: parsed.assessment?.confidence || "medium",
             canHandle: parsed.assessment?.canHandle !== false,
             risks: Array.isArray(parsed.assessment?.risks) ? parsed.assessment.risks : [],
             blockers: Array.isArray(parsed.assessment?.blockers) ? parsed.assessment.blockers : [],
-            recommendedMode: parsed.assessment?.recommendedMode || null,
+            recommendedMode,
             clarificationNeeded: parsed.assessment?.clarificationNeeded || null,
-            estimatedComplexity: parsed.assessment?.estimatedComplexity || "moderate",
+            estimatedComplexity: complexity,
           },
         };
       } catch (_) {}
@@ -225,6 +326,9 @@ Rules for assessment:
   }
 }
 
+// ─────────────────────────────────────────────
+// AGENT ITERATION (core loop)
+// ─────────────────────────────────────────────
 export async function runAgentIteration(
   userMessage: string,
   projectContext: {
@@ -233,12 +337,18 @@ export async function runAgentIteration(
     framework: string;
     description: string;
     workingDir?: string;
+    editorContext?: {
+      activeFile: string | null;
+      selection: string | null;
+      cursorLine: number | null;
+    };
   },
   files: Array<{ path: string; content: string }>,
   conversationHistory: Array<{ role: string; content: string }>,
   shellResults?: Array<{ command: string; stdout: string; stderr: string; exitCode: number }>,
   options?: {
-    mode?: "fast" | "power" | "economy" | "autonomy";
+    mode?: AgentMode;
+    modelOverride?: string;
     attachments?: Array<{ type: string; data: string; name: string }>;
   }
 ): Promise<{
@@ -247,21 +357,27 @@ export async function runAgentIteration(
   shellCommands?: string[];
   planSteps?: string[];
   reasoning?: string;
+  modelUsed?: string;
   done: boolean;
 }> {
   const client = getClient();
   if (!client) return { message: fallbackResponse(userMessage), done: true };
 
   try {
-    const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
     const mode = options?.mode || "power";
+    const { model: autoModel } = selectModelForMode(mode);
+    const modelName = options?.modelOverride || autoModel;
 
     const filePaths = files.map(f => f.path);
     const dirTree = buildDirTree(filePaths);
 
+    // For Max/Power modes include more files with more content
+    const maxFiles = mode === "max" ? 30 : mode === "power" ? 20 : 15;
+    const maxChars = mode === "max" ? 4000 : 2500;
+
     const fileList = files
-      .slice(0, 20)
-      .map(f => `### ${f.path}\n\`\`\`\n${f.content.substring(0, 2500)}\n\`\`\``)
+      .slice(0, maxFiles)
+      .map(f => `### ${f.path}\n\`\`\`\n${f.content.substring(0, maxChars)}\n\`\`\``)
       .join("\n\n");
 
     const historyText = conversationHistory
@@ -273,32 +389,60 @@ export async function runAgentIteration(
       ? `\nRecent Shell Results:\n${shellResults.map(r => `$ ${r.command}\n[exit ${r.exitCode}] ${r.stdout}${r.stderr ? "\nSTDERR: " + r.stderr : ""}`).join("\n---\n")}`
       : "";
 
-    const modeInstructions = {
-      fast: "Be concise. Make minimal focused changes. Set done=true after one pass.",
-      power: "Be thorough. Use shell commands to validate. Fix errors iteratively.",
-      economy: "Make the smallest possible change to solve the problem. Avoid touching unrelated files.",
-      autonomy: "Work autonomously. Plan, implement, test, and iterate until the feature is fully working.",
-    }[mode];
+    const modeInstructions: Record<AgentMode, string> = {
+      lite: "Be very concise. Make one focused change. Set done=true after one pass. Do NOT run shell commands unless truly necessary.",
+      economy: "Make the smallest possible change to solve the problem. Touch as few files as possible. Set done=true when the minimal fix is applied.",
+      power: "Be thorough. Use shell commands to validate. Fix errors iteratively across multiple files.",
+      agent: "Work autonomously. Plan, implement, test, and iterate until the feature is fully working.",
+      max: "Work like a senior engineer with unlimited time. Be exhaustive. Implement the COMPLETE solution including edge cases, error handling, and tests. Run commands to verify. Only set done=true when the entire feature is truly complete and tested.",
+      test: "You are a test engineer. Write comprehensive tests covering happy paths, edge cases, and error cases. Run existing tests to see what passes/fails. Fix any failures. Use the appropriate test framework for this project.",
+      optimize: "You are a performance and code quality engineer. First analyze the codebase holistically, then implement concrete optimizations: reduce complexity, improve performance, eliminate dead code, improve readability, and add missing error handling.",
+    };
 
     const workingDirNote = projectContext.workingDir
       ? `\nProject working directory (relative to shell CWD): ${projectContext.workingDir}\nShell commands run from the filesystem root of this project.\nTo work in the project: "cd ${projectContext.workingDir} && command"\nTo work in client: "cd ${projectContext.workingDir}/client && command"`
       : "";
 
-    const modeGuide = `
-MODE GUIDE — when to recommend switching:
-- FAST: Only for tiny isolated edits (fix a typo, rename a variable, add one line). One file, no deps.
-- ECONOMY: Fix one specific bug with minimal changes. Don't touch unrelated code.
-- POWER: Feature additions, multi-file edits, refactors, config changes. Run validations.
-- AUTONOMY (8 passes, human-in-loop): Complex tasks — new services, install dependencies, full feature implementation, debugging cascading errors across many files. If the task is clearly complex (requires 5+ file changes, dependency installs, or architecture decisions), explicitly say "NOTE: This task would benefit from Autonomy mode" in your message.`;
+    const languageSpecificNotes: Record<string, string> = {
+      python: `\nPython project notes:
+- Use python3 for all commands (not python)
+- Install deps with: pip install -r requirements.txt
+- For FastAPI: run with uvicorn main:app --host 0.0.0.0 --port 3000 --reload
+- For Flask: run with python3 -m flask run --host 0.0.0.0 --port 3000
+- For Django: run with python3 manage.py runserver 0.0.0.0:3000
+- Always bind to 0.0.0.0 and port 3000 for the preview to work`,
+      go: `\nGo project notes:
+- Run with: go run .
+- Install deps with: go mod download
+- For web servers, listen on 0.0.0.0:3000 for the preview to work
+- Use go mod tidy to clean up dependencies`,
+      rust: `\nRust project notes:
+- Run with: cargo run
+- Build with: cargo build
+- For web servers (actix-web, axum, rocket), bind to 0.0.0.0:3000
+- Use cargo add <crate> to add dependencies`,
+      ruby: `\nRuby project notes:
+- Run with: ruby main.rb
+- Install deps with: bundle install
+- For Rails: run with rails server -b 0.0.0.0 -p 3000`,
+      java: `\nJava project notes:
+- For Maven: mvn spring-boot:run
+- For Gradle: ./gradlew bootRun
+- Bind to port 3000 for preview`,
+    };
+    const langNote = languageSpecificNotes[projectContext.language] || "";
 
-    const systemPrompt = `You are SudoAI, an expert AI software engineer with deep reasoning.
+    const editorContextNote = projectContext.editorContext?.activeFile
+      ? `\n\nEditor Context: The user is currently viewing "${projectContext.editorContext.activeFile}"${projectContext.editorContext.cursorLine ? ` at line ${projectContext.editorContext.cursorLine}` : ""}.${projectContext.editorContext.selection ? `\nSelected text:\n\`\`\`\n${projectContext.editorContext.selection.substring(0, 2000)}\n\`\`\`` : ""}\nPrioritize this file in your response when relevant.`
+      : "";
+
+    const systemPrompt = `You are SudoAI, an expert AI software engineer.
 You run in an iterative fix-and-test loop: write code → run shell commands → see output → fix errors → repeat.
-Current mode: ${mode.toUpperCase()} — ${modeInstructions}
-${modeGuide}
+Current mode: ${mode.toUpperCase()} — ${modeInstructions[mode]}
 
 Project: "${projectContext.name}" (${projectContext.language}/${projectContext.framework})
 ${projectContext.description ? `Description: ${projectContext.description}` : ""}
-${workingDirNote}
+${workingDirNote}${langNote}${editorContextNote}
 
 CRITICAL — Shell command rules:
 - Each shell command runs in isolation. NO persistent working directory between commands.
@@ -309,7 +453,7 @@ CRITICAL — Shell command rules:
 Directory tree:
 ${dirTree}
 
-Current files (up to 20, truncated at 2500 chars each):
+Current files (up to ${maxFiles}, truncated at ${maxChars} chars each):
 ${fileList || "No files yet"}
 
 ${historyText ? `Recent conversation:\n${historyText}` : ""}
@@ -317,15 +461,16 @@ ${shellResultsText}
 
 ══════════════════════════════════════════════════════
 MANDATORY: THINK BEFORE ACTING
-You MUST reason through the problem before writing any code or running commands.
 Start your response with a <thinking> block:
 
 <thinking>
 UNDERSTAND: What is the user actually asking for? What is the goal?
 CODEBASE: What files are involved? What is the current state of the relevant code?
 APPROACH: What is the best way to implement this? What are the tradeoffs?
-RISKS: What could break? What side effects might occur? What am I uncertain about?
-MODE CHECK: Is ${mode.toUpperCase()} mode appropriate for this task, or should the user switch?
+RISKS: What could break? What side effects might occur?
+${mode === "max" ? "COMPLETENESS: Am I implementing the FULL solution or just a partial one? What am I missing?" : ""}
+${mode === "test" ? "TEST STRATEGY: What test framework is being used? What cases need coverage?" : ""}
+${mode === "optimize" ? "OPTIMIZATION TARGETS: What are the biggest performance/quality wins?" : ""}
 PLAN: Exact steps I will take (numbered).
 </thinking>
 
@@ -339,12 +484,14 @@ Return format — thinking block FIRST, then JSON:
 
 AGENT_ACTION:
 {
-  "message": "Clear explanation of what I did and why. If mode change is recommended, say so here.",
+  "message": "Clear explanation of what I did and why.",
   "planSteps": ["step 1", "step 2"],
   "fileUpdates": [{"path": "full/path/from/root.ts", "content": "full file content"}],
-  "shellCommands": ["cd ${projectContext.workingDir || "."} && npm install"],
+  "shellCommands": ["cd ${projectContext.workingDir || "."} && npm test"],
   "done": false
-}`;
+}
+
+Important: Set "done": true only when the task is TRULY complete (${mode === "max" ? "full feature working and tested" : mode === "test" ? "all tests passing" : mode === "optimize" ? "all optimizations applied" : "requested change implemented"}).`;
 
     const parts: any[] = [systemPrompt, `User Message: ${userMessage}`];
 
@@ -361,17 +508,27 @@ AGENT_ACTION:
       }
     }
 
-    const result = await model.generateContent(parts);
-    const text = result.response.text().trim();
+    const text = await callModel(modelName, parts);
 
-    // Extract <thinking> block from response
     const thinkingMatch = text.match(/<thinking>([\s\S]*?)<\/thinking>/i);
     const reasoning = thinkingMatch ? thinkingMatch[1].trim() : undefined;
 
     const parsed = extractAgentAction(text);
-    if (parsed) return { ...parsed, reasoning };
+    if (parsed) {
+      return {
+        ...parsed,
+        message: stripThinkingTags(parsed.message || ""),
+        reasoning,
+        modelUsed: modelName,
+      };
+    }
 
-    return { message: text, done: true, reasoning };
+    const cleanText = stripThinkingTags(text)
+      .replace(/AGENT_ACTION:\s*```?(?:json)?\s*\{[\s\S]*?\}\s*```?/gi, "")
+      .replace(/```json\s*\{[\s\S]*?"message"[\s\S]*?"done"[\s\S]*?\}\s*```/gi, "")
+      .replace(/^\s*\{[\s\S]*?"message"[\s\S]*?"done"\s*:[\s\S]*?\}\s*$/gm, "")
+      .trim();
+    return { message: cleanText || stripThinkingTags(text), done: true, reasoning, modelUsed: modelName };
   } catch (err: any) {
     console.error("[Gemini] Agent iteration error:", err.message);
     return { message: `I encountered an error: ${err.message}`, done: true };
@@ -385,24 +542,31 @@ function extractAgentAction(text: string): {
   planSteps?: string[];
   done: boolean;
 } | null {
-  const prefixMatch = text.match(/AGENT_ACTION:\s*(\{[\s\S]*\})/i);
+  const stripped = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "").trim();
+
+  const prefixMatch = stripped.match(/AGENT_ACTION:\s*(\{[\s\S]*\})/i);
   if (prefixMatch) {
     try { return JSON.parse(prefixMatch[1]); } catch (_) {}
   }
 
-  const fenceMatch = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+  const fenceMatch = stripped.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
   if (fenceMatch) {
     try { return JSON.parse(fenceMatch[1]); } catch (_) {}
   }
 
-  const objMatch = text.match(/^\s*(\{[\s\S]*\})\s*$/);
+  const objMatch = stripped.match(/^\s*(\{[\s\S]*\})\s*$/);
   if (objMatch) {
-    try { return JSON.parse(objMatch[1]); } catch (_) {}
+    try { return JSON.parse(objMatch[0]); } catch (_) {}
   }
 
-  const anyMatch = text.match(/\{[\s\S]*?"message"[\s\S]*?\}/);
+  const anyMatch = stripped.match(/\{[\s\S]*?"message"[\s\S]*?"done"\s*:\s*(true|false)[\s\S]*?\}/);
   if (anyMatch) {
     try { return JSON.parse(anyMatch[0]); } catch (_) {}
+  }
+
+  const fallbackMatch = stripped.match(/\{[\s\S]*?"message"[\s\S]*?\}/);
+  if (fallbackMatch) {
+    try { return JSON.parse(fallbackMatch[0]); } catch (_) {}
   }
 
   return null;
@@ -422,8 +586,6 @@ export async function getAgentResponse(
   if (!client) return { message: fallbackResponse(userMessage) };
 
   try {
-    const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
-
     const fileList = files
       .slice(0, 6)
       .map(f => `### ${f.path}\n\`\`\`\n${f.content.substring(0, 1500)}\n\`\`\``)
@@ -454,8 +616,7 @@ Instructions:
 - Give a clear explanation of what you did
 - For explanations/questions, just respond normally without file blocks`;
 
-    const result = await model.generateContent([systemPrompt, `User: ${userMessage}`]);
-    const text = result.response.text();
+    const text = await callModel(MODELS.flash, [systemPrompt, `User: ${userMessage}`]);
 
     const fileUpdates: Array<{ path: string; content: string }> = [];
     const fileRegex = /===FILE: (.+?)===\n([\s\S]*?)===END===/g;
@@ -464,7 +625,8 @@ Instructions:
       fileUpdates.push({ path: match[1].trim(), content: match[2].trim() });
     }
 
-    const cleanMessage = text.replace(/===FILE: .+?===\n[\s\S]*?===END===/g, "").trim();
+    let cleanMessage = text.replace(/===FILE: .+?===\n[\s\S]*?===END===/g, "").trim();
+    cleanMessage = stripThinkingTags(cleanMessage);
 
     return {
       message: cleanMessage || text,

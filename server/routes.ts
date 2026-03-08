@@ -9,11 +9,13 @@ import {
   initGit, getGitStatus, gitCommit, getGitLog, getGitDiff, execShell,
   getGitBranches, gitReset, gitCreateBranch, gitCheckout, gitStash
 } from "./project-fs";
-import { runAgentIteration, generateProjectCode, thinkAgentPlan } from "./gemini";
+import { runAgentIteration, generateProjectCode, thinkAgentPlan, selectModelForMode, callModelStream, type AgentMode } from "./gemini";
+import { runClaudeAgentIteration, isClaudeAvailable, CLAUDE_MODELS } from "./anthropic";
 import { importFromGitHub, importFromZip } from "./import-handlers";
 import {
-  startProcess, killProcess, getProcess,
-  detectStartCommand, detectInstallCommand, detectInstallCommands
+  startProcess, killProcess, getProcess, getProcesses, restartProcess,
+  detectStartCommand, detectInstallCommand, detectInstallCommands,
+  detectProjectRuntime,
 } from "./process-manager";
 import path from "path";
 import fs from "fs";
@@ -42,6 +44,24 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+
+  // ────────── AI PROVIDERS INFO ──────────
+  app.get("/api/ai/providers", (_req, res) => {
+    const claudeReady = isClaudeAvailable();
+    res.json({
+      gemini: !!process.env.GEMINI_API_KEY,
+      claude: claudeReady,
+      models: {
+        lite: { provider: "gemini", label: "Flash" },
+        economy: { provider: "gemini", label: "Flash" },
+        power: { provider: "gemini", label: "Flash / Pro" },
+        agent: { provider: claudeReady ? "claude" : "gemini", label: claudeReady ? "Claude Sonnet" : "Flash" },
+        max: { provider: claudeReady ? "claude" : "gemini", label: claudeReady ? "Claude Opus" : "Pro" },
+        test: { provider: "gemini", label: "Flash Thinking" },
+        optimize: { provider: "gemini", label: "Pro" },
+      },
+    });
+  });
 
   // ────────── PROJECTS ──────────
   app.get("/api/projects", async (_req, res) => {
@@ -206,6 +226,15 @@ export async function registerRoutes(
   app.patch("/api/projects/:id/files/:fileId", async (req, res) => {
     const parsed = z.object({ content: z.string() }).safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ message: "Content required" });
+    const existing = await storage.getFile(req.params.fileId);
+    if (!existing) return res.status(404).json({ message: "File not found" });
+    await storage.createFileVersion({
+      fileId: existing.id,
+      projectId: req.params.id,
+      content: existing.content,
+      path: existing.path,
+      size: String(Buffer.byteLength(existing.content, "utf8")),
+    });
     const file = await storage.updateFile(req.params.fileId, parsed.data.content);
     if (!file) return res.status(404).json({ message: "File not found" });
     await writeProjectFile(req.params.id, file.path, file.content);
@@ -250,6 +279,36 @@ export async function registerRoutes(
     res.json({ success: true });
   });
 
+  // ────────── FILE VERSION HISTORY ──────────
+  app.get("/api/projects/:id/files/:fileId/history", async (req, res) => {
+    const versions = await storage.getFileVersions(req.params.fileId, req.params.id);
+    res.json(versions);
+  });
+
+  app.get("/api/projects/:id/files/:fileId/history/:versionId", async (req, res) => {
+    const version = await storage.getFileVersion(req.params.versionId);
+    if (!version) return res.status(404).json({ message: "Version not found" });
+    res.json(version);
+  });
+
+  app.post("/api/projects/:id/files/:fileId/history/:versionId/restore", async (req, res) => {
+    const version = await storage.getFileVersion(req.params.versionId);
+    if (!version) return res.status(404).json({ message: "Version not found" });
+    const currentFile = await storage.getFile(req.params.fileId);
+    if (!currentFile) return res.status(404).json({ message: "File not found" });
+    await storage.createFileVersion({
+      fileId: currentFile.id,
+      projectId: req.params.id,
+      content: currentFile.content,
+      path: currentFile.path,
+      size: String(Buffer.byteLength(currentFile.content, "utf8")),
+    });
+    const file = await storage.updateFile(req.params.fileId, version.content);
+    if (!file) return res.status(404).json({ message: "File not found" });
+    await writeProjectFile(req.params.id, file.path, file.content);
+    res.json(file);
+  });
+
   // ────────── AI MESSAGES ──────────
   app.get("/api/projects/:id/messages", async (req, res) => {
     res.json(await storage.getMessages(req.params.id));
@@ -259,33 +318,77 @@ export async function registerRoutes(
   async function runAgentBatch(
     projectId: string,
     userMessage: string,
-    projectCtx: { name: string; language: string; framework: string; description: string; workingDir?: string },
-    mode: string,
+    projectCtx: { name: string; language: string; framework: string; description: string; workingDir?: string; editorContext?: { activeFile: string | null; selection: string | null; cursorLine: number | null } },
+    mode: AgentMode,
     startIteration: number,
     batchSize: number,
-    attachments?: Array<{ type: string; data: string; name: string }>
-  ): Promise<{ finalMessage: string; filesUpdated: number; done: boolean; stoppedAtIteration: number }> {
+    attachments?: Array<{ type: string; data: string; name: string }>,
+    modelOverride?: string
+  ): Promise<{ finalMessage: string; filesUpdated: number; updatedPaths: string[]; shellCommandsRun: string[]; done: boolean; stoppedAtIteration: number }> {
     let currentFiles = await storage.getFiles(projectId);
     let history = await storage.getMessages(projectId);
     let shellResults: Array<{ command: string; stdout: string; stderr: string; exitCode: number }> = [];
     let finalAiMessage = "";
     let totalFilesUpdated = 0;
+    const allUpdatedPaths: string[] = [];
+    const allShellCommands: string[] = [];
     let done = false;
 
     for (let i = 0; i < batchSize; i++) {
       const globalIteration = startIteration + i;
       await storage.createLog({ projectId, type: "system", message: `🔄 Iteration ${globalIteration + 1}...`, stage: "agent" });
+      await storage.createLog({ projectId, type: "system", message: `__ACTION__${JSON.stringify({ type: "thinking", message: `Analyzing codebase (step ${globalIteration + 1})...` })}`, stage: "agent" });
 
-      const response = await runAgentIteration(
-        userMessage,
-        projectCtx,
-        currentFiles.map(f => ({ path: f.path, content: f.content })),
-        history.map(m => ({ role: m.role, content: m.content })),
-        shellResults,
-        { mode: mode as any, attachments: globalIteration === 0 ? attachments : undefined }
-      );
+      // Use Claude for agent/max modes when available, else fall back to Gemini
+      const usesClaude = isClaudeAvailable() && (mode === "agent" || mode === "max");
+      let response: Awaited<ReturnType<typeof runAgentIteration>>;
+      if (usesClaude) {
+        try {
+          const claudeModel = mode === "max" ? CLAUDE_MODELS.opus : CLAUDE_MODELS.sonnet;
+          response = await runClaudeAgentIteration(
+            userMessage,
+            projectCtx,
+            currentFiles.map(f => ({ path: f.path, content: f.content })),
+            history.map(m => ({ role: m.role, content: m.content })),
+            shellResults,
+            { mode, modelOverride: claudeModel }
+          );
+        } catch (claudeErr: any) {
+          console.warn("[Agent] Claude failed, falling back to Gemini:", claudeErr.message);
+          response = await runAgentIteration(
+            userMessage,
+            projectCtx,
+            currentFiles.map(f => ({ path: f.path, content: f.content })),
+            history.map(m => ({ role: m.role, content: m.content })),
+            shellResults,
+            { mode, modelOverride, attachments: globalIteration === 0 ? attachments : undefined }
+          );
+        }
+      } else {
+        response = await runAgentIteration(
+          userMessage,
+          projectCtx,
+          currentFiles.map(f => ({ path: f.path, content: f.content })),
+          history.map(m => ({ role: m.role, content: m.content })),
+          shellResults,
+          { mode, modelOverride, attachments: globalIteration === 0 ? attachments : undefined }
+        );
+      }
 
       finalAiMessage = response.message;
+
+      // Emit the model used
+      if (response.modelUsed) {
+        const { label } = usesClaude
+          ? { label: mode === "max" ? "Claude Opus" : "Claude Sonnet" }
+          : selectModelForMode(mode);
+        await storage.createLog({
+          projectId,
+          type: "system",
+          message: `__MODEL__${JSON.stringify({ model: response.modelUsed, label })}`,
+          stage: "agent",
+        });
+      }
 
       // Emit the agent's chain-of-thought reasoning as a visible log
       if (response.reasoning) {
@@ -299,11 +402,11 @@ export async function registerRoutes(
 
       // Detect mode recommendations in message or reasoning
       const modeNoteText = response.reasoning || response.message;
-      if (modeNoteText && /autonomy mode|switch.*autonomy|benefit from auto/i.test(modeNoteText)) {
+      if (modeNoteText && /max mode|switch.*max|benefit from max|very complex/i.test(modeNoteText)) {
         await storage.createLog({
           projectId,
           type: "system",
-          message: `__RECOMMEND__${JSON.stringify({ mode: "autonomy", reason: "Agent recommends Autonomy mode for this complex task" })}`,
+          message: `__RECOMMEND__${JSON.stringify({ mode: "max", reason: "Agent recommends Max mode for this complex task" })}`,
           stage: "agent",
         });
       }
@@ -311,6 +414,7 @@ export async function registerRoutes(
       const allFileUpdates = response.fileUpdates || [];
       for (const update of allFileUpdates) {
         const existing = currentFiles.find(f => f.path === update.path);
+        const oldContent = existing ? existing.content : null;
         if (existing) {
           await storage.updateFile(existing.id, update.content);
           await writeProjectFile(projectId, update.path, update.content);
@@ -327,7 +431,14 @@ export async function registerRoutes(
           currentFiles.push(newFile);
         }
         await storage.createLog({ projectId, type: "info", message: `📝 Updated ${update.path}`, stage: "agent" });
+        await storage.createLog({ projectId, type: "system", message: `__ACTION__${JSON.stringify({ type: "edit", path: update.path })}`, stage: "agent" });
+        await storage.createLog({
+          projectId, type: "system",
+          message: `__FILEDIFF__${JSON.stringify({ path: update.path, oldContent, newContent: update.content, isNew: oldContent === null })}`,
+          stage: "agent",
+        });
         totalFilesUpdated++;
+        if (!allUpdatedPaths.includes(update.path)) allUpdatedPaths.push(update.path);
       }
 
       if (response.shellCommands && response.shellCommands.length > 0) {
@@ -339,14 +450,25 @@ export async function registerRoutes(
 
         for (const cmd of response.shellCommands) {
           await storage.createLog({ projectId, type: "system", message: `$ ${cmd}`, stage: "agent" });
+          await storage.createLog({ projectId, type: "system", message: `__ACTION__${JSON.stringify({ type: "shell", command: cmd })}`, stage: "agent" });
+          allShellCommands.push(cmd);
           const result = await execShell(projectId, cmd, projectDir, env);
           shellResults.push({ command: cmd, ...result });
+          const outputMsg = `${result.stdout}${result.stderr ? "\n" + result.stderr : ""}`.trim();
           await storage.createLog({
             projectId,
             type: result.exitCode === 0 ? "info" : "error",
-            message: `${result.stdout}${result.stderr ? "\n" + result.stderr : ""}`.trim(),
+            message: outputMsg,
             stage: "agent",
           });
+          await storage.createLog({
+            projectId, type: "system",
+            message: `__SHELLOUTPUT__${JSON.stringify({ command: cmd, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode })}`,
+            stage: "agent",
+          });
+          if (result.exitCode !== 0) {
+            await storage.createLog({ projectId, type: "system", message: `__ACTION__${JSON.stringify({ type: "error", message: `Command failed: ${cmd}`, command: cmd, stderr: result.stderr })}`, stage: "agent" });
+          }
         }
       } else {
         shellResults = [];
@@ -354,29 +476,55 @@ export async function registerRoutes(
 
       if (response.done || (!response.shellCommands?.length && !response.fileUpdates?.length)) {
         done = true;
+        await storage.createLog({ projectId, type: "system", message: `__ACTION__${JSON.stringify({ type: "complete", filesUpdated: totalFilesUpdated, message: "Task complete" })}`, stage: "agent" });
         break;
+      }
+
+      const hasErrors = shellResults.some(r => r.exitCode !== 0);
+      if (hasErrors && i < batchSize - 1) {
+        await storage.createLog({ projectId, type: "system", message: `__ACTION__${JSON.stringify({ type: "fix", message: "Detected errors — analyzing and applying fix..." })}`, stage: "agent" });
       }
 
       currentFiles = await storage.getFiles(projectId);
     }
 
-    return { finalMessage: finalAiMessage, filesUpdated: totalFilesUpdated, done, stoppedAtIteration: startIteration + batchSize };
+    if (!done) {
+      await storage.createLog({ projectId, type: "system", message: `__ACTION__${JSON.stringify({ type: "complete", filesUpdated: totalFilesUpdated, message: "Batch complete" })}`, stage: "agent" });
+    }
+
+    if (totalFilesUpdated > 0) {
+      try {
+        const commitMsg = `AI agent: ${allUpdatedPaths.slice(0, 5).join(", ")}${allUpdatedPaths.length > 5 ? ` +${allUpdatedPaths.length - 5} more` : ""}`;
+        await gitCommit(projectId, commitMsg);
+        await storage.createLog({ projectId, type: "system", message: `__ACTION__${JSON.stringify({ type: "checkpoint", message: "Checkpoint created" })}`, stage: "agent" });
+      } catch (_) {}
+    }
+
+    return { finalMessage: finalAiMessage, filesUpdated: totalFilesUpdated, updatedPaths: allUpdatedPaths, shellCommandsRun: allShellCommands, done, stoppedAtIteration: startIteration + batchSize };
   }
 
   app.post("/api/projects/:id/messages", async (req, res) => {
     const parsed = z.object({
       content: z.string().min(1),
-      mode: z.enum(["fast", "power", "economy", "autonomy"]).default("power"),
+      mode: z.enum(["lite", "economy", "power", "agent", "max", "test", "optimize", "fast", "autonomy"]).default("power"),
       phase: z.enum(["think", "execute"]).optional(),
       attachments: z.array(z.object({
         type: z.string(),
         data: z.string(),
         name: z.string(),
       })).optional(),
+      activeFile: z.string().nullable().optional(),
+      selection: z.string().nullable().optional(),
+      cursorLine: z.number().nullable().optional(),
     }).safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ message: "Content required" });
 
     const { mode, attachments, phase } = parsed.data;
+    const editorCtx = {
+      activeFile: parsed.data.activeFile || null,
+      selection: parsed.data.selection || null,
+      cursorLine: parsed.data.cursorLine || null,
+    };
     const projectId = req.params.id;
 
     const project = await storage.getProject(projectId);
@@ -399,31 +547,37 @@ export async function registerRoutes(
       framework: project.framework,
       description: project.description || "",
       workingDir: agentWorkingDirRel,
+      editorContext: editorCtx.activeFile ? editorCtx : undefined,
     };
 
-    // ── AUTONOMY THINK PHASE ─────────────────────────────────────────────────
-    // When phase="think", run only the analysis pass — no code changes yet
-    if (mode === "autonomy" && phase === "think") {
+    // Normalize legacy mode names
+    const normalizedMode: AgentMode = mode === "fast" ? "lite"
+      : mode === "autonomy" ? "agent"
+      : mode as AgentMode;
+
+    const { model: selectedModel, label: modelLabel } = selectModelForMode(normalizedMode);
+
+    // ── AGENT / AUTONOMY THINK PHASE (human-in-loop) ─────────────────────────
+    if (normalizedMode === "agent" && phase === "think") {
       const userMsg = await storage.createMessage({ projectId, role: "user", content: parsed.data.content });
-      await storage.createLog({ projectId, type: "system", message: `🧠 Planning... [autonomy mode]`, stage: "agent" });
+      await storage.createLog({ projectId, type: "system", message: `🧠 Planning... [agent mode · ${modelLabel}]`, stage: "agent" });
 
       const history = await storage.getMessages(projectId);
       const thinkResult = await thinkAgentPlan(
         parsed.data.content,
         projectCtx,
         allFiles.map(f => ({ path: f.path, content: f.content })),
-        history.map(m => ({ role: m.role, content: m.content }))
+        history.map(m => ({ role: m.role, content: m.content })),
+        normalizedMode
       );
 
-      // Store plan as a structured log for the UI to render
       await storage.createLog({
         projectId,
         type: "system",
-        message: `__PLAN__${JSON.stringify(thinkResult)}`,
+        message: `__PLAN__${JSON.stringify({ ...thinkResult, modelSelected: selectedModel, modelLabel })}`,
         stage: "agent",
       });
 
-      // Create an autonomy session
       const sessionId = `aut_${projectId}_${Date.now()}`;
       autonomySessions.set(sessionId, {
         projectId,
@@ -438,32 +592,76 @@ export async function registerRoutes(
         user: userMsg,
         plan: thinkResult,
         sessionId,
+        modelLabel,
       });
     }
 
-    // ── NON-AUTONOMY FLOW ────────────────────────────────────────────────────
-    const userMsg = await storage.createMessage({ projectId, role: "user", content: parsed.data.content });
-    await storage.createLog({ projectId, type: "system", message: `🤖 Agent starting... [${mode} mode]`, stage: "agent" });
+    // ── MAX MODE — fully autonomous, no checkpoints, Pro model ───────────────
+    if (normalizedMode === "max" && phase === "think") {
+      const userMsg = await storage.createMessage({ projectId, role: "user", content: parsed.data.content });
+      await storage.createLog({ projectId, type: "system", message: `🚀 Analyzing task... [Max mode · ${modelLabel}]`, stage: "agent" });
 
-    // Always run a think step (non-blocking, fast) — shown as progress in UI
+      const history = await storage.getMessages(projectId);
+      const thinkResult = await thinkAgentPlan(
+        parsed.data.content,
+        projectCtx,
+        allFiles.map(f => ({ path: f.path, content: f.content })),
+        history.map(m => ({ role: m.role, content: m.content })),
+        normalizedMode
+      );
+
+      await storage.createLog({
+        projectId,
+        type: "system",
+        message: `__PLAN__${JSON.stringify({ ...thinkResult, modelSelected: selectedModel, modelLabel })}`,
+        stage: "agent",
+      });
+
+      // Max mode: create session with 20 iterations, no checkpoint stops
+      const sessionId = `max_${projectId}_${Date.now()}`;
+      autonomySessions.set(sessionId, {
+        projectId,
+        userMessage: parsed.data.content,
+        iterationsDone: 0,
+        totalIterations: 20,
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      });
+
+      return res.json({
+        status: "pending_approval",
+        user: userMsg,
+        plan: thinkResult,
+        sessionId,
+        modelLabel,
+        isMax: true,
+      });
+    }
+
+    // ── STANDARD FLOW (lite, economy, power, test, optimize) ─────────────────
+    const userMsg = await storage.createMessage({ projectId, role: "user", content: parsed.data.content });
+    const modeEmoji: Record<AgentMode, string> = {
+      lite: "⚡", economy: "🌿", power: "💪", agent: "🤖",
+      max: "🚀", test: "🧪", optimize: "⚙️", fast: "⚡", autonomy: "🤖",
+    };
+    await storage.createLog({ projectId, type: "system", message: `${modeEmoji[normalizedMode] || "🤖"} Starting... [${normalizedMode} mode · ${modelLabel}]`, stage: "agent" });
+
     const history = await storage.getMessages(projectId);
     const thinkResult = await thinkAgentPlan(
       parsed.data.content,
       projectCtx,
       allFiles.map(f => ({ path: f.path, content: f.content })),
-      history.map(m => ({ role: m.role, content: m.content }))
+      history.map(m => ({ role: m.role, content: m.content })),
+      normalizedMode
     );
 
-    // Store plan log for UI rendering
     await storage.createLog({
       projectId,
       type: "system",
-      message: `__PLAN__${JSON.stringify(thinkResult)}`,
+      message: `__PLAN__${JSON.stringify({ ...thinkResult, modelSelected: selectedModel, modelLabel })}`,
       stage: "agent",
     });
 
-    // Emit mode recommendation if needed
-    if (thinkResult.assessment.recommendedMode && thinkResult.assessment.recommendedMode !== mode) {
+    if (thinkResult.assessment.recommendedMode && thinkResult.assessment.recommendedMode !== normalizedMode) {
       await storage.createLog({
         projectId,
         type: "system",
@@ -472,27 +670,229 @@ export async function registerRoutes(
       });
     }
 
-    // If agent cannot handle: explain and stop
     if (!thinkResult.assessment.canHandle) {
       const blockerMsg = `I can't complete this task as-is. Here's why:\n\n${thinkResult.assessment.blockers.join("\n")}\n\n${thinkResult.assessment.clarificationNeeded ? `To proceed, I need: ${thinkResult.assessment.clarificationNeeded}` : ""}`;
       const aiMsg = await storage.createMessage({ projectId, role: "assistant", content: blockerMsg });
       return res.json({ user: userMsg, assistant: aiMsg, filesUpdated: 0, plan: thinkResult });
     }
 
-    // Clarification needed
     if (thinkResult.assessment.clarificationNeeded) {
       const aiMsg = await storage.createMessage({ projectId, role: "assistant", content: `Before I start, I need some clarification:\n\n${thinkResult.assessment.clarificationNeeded}` });
       return res.json({ user: userMsg, assistant: aiMsg, filesUpdated: 0, plan: thinkResult });
     }
 
-    const maxIterations = mode === "fast" ? 1 : mode === "economy" ? 1 : 4;
+    const maxIterationsMap: Record<AgentMode, number> = {
+      lite: 1, economy: 1, power: 4, agent: 8,
+      max: 20, test: 6, optimize: 5, fast: 1, autonomy: 8,
+    };
+    const maxIterations = maxIterationsMap[normalizedMode] ?? 4;
 
-    const { finalMessage, filesUpdated, done: execDone } = await runAgentBatch(
-      projectId, parsed.data.content, projectCtx, mode, 0, maxIterations, attachments
+    const { finalMessage, filesUpdated, updatedPaths, shellCommandsRun } = await runAgentBatch(
+      projectId, parsed.data.content, projectCtx, normalizedMode, 0, maxIterations, attachments, selectedModel
     );
 
-    const aiMsg = await storage.createMessage({ projectId, role: "assistant", content: finalMessage });
-    res.json({ user: userMsg, assistant: aiMsg, filesUpdated, plan: thinkResult });
+    const cleanedFinalMessage = finalMessage
+      .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+      .replace(/AGENT_ACTION:\s*```?(?:json)?\s*\{[\s\S]*?\}\s*```?/gi, "")
+      .replace(/```json\s*\{[\s\S]*?"message"[\s\S]*?"done"[\s\S]*?\}\s*```/gi, "")
+      .replace(/^\s*\{[\s\S]*?"message"[\s\S]*?"done"\s*:[\s\S]*?\}\s*$/gm, "")
+      .trim();
+    const aiMsg = await storage.createMessage({ projectId, role: "assistant", content: cleanedFinalMessage || finalMessage });
+    res.json({ user: userMsg, assistant: aiMsg, filesUpdated, updatedPaths, shellCommandsRun, plan: thinkResult, modelLabel });
+  });
+
+  app.post("/api/projects/:id/messages/stream", async (req, res) => {
+    const projectId = req.params.id;
+    const parsed = z.object({
+      content: z.string(),
+      mode: z.string().optional(),
+      activeFile: z.string().nullable().optional(),
+      selection: z.string().nullable().optional(),
+      cursorLine: z.number().nullable().optional(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
+
+    const project = await storage.getProject(projectId);
+    if (!project) return res.status(404).json({ error: "Project not found" });
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders();
+
+    let clientDisconnected = false;
+    req.on("close", () => { clientDisconnected = true; });
+
+    const sendEvent = (event: string, data: any) => {
+      if (!clientDisconnected) {
+        try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (_) {}
+      }
+    };
+
+    try {
+      const allFiles = await storage.getFiles(projectId);
+      const mode = (parsed.data.mode || "power") as AgentMode;
+      const { model: autoModel, label: modelLabel } = selectModelForMode(mode);
+
+      sendEvent("status", { phase: "thinking", model: modelLabel });
+
+      const userMsg = await storage.createMessage({ projectId, role: "user", content: parsed.data.content });
+      sendEvent("user", { id: userMsg.id, content: userMsg.content });
+
+      const history = await storage.getMessages(projectId);
+
+      let agentWorkingDirRel = "";
+      const pkgFile = allFiles.find((f: any) => f.name === "package.json" || f.path.endsWith("/package.json"));
+      if (pkgFile && pkgFile.path !== "package.json") {
+        const subDir = path.dirname(pkgFile.path);
+        if (subDir && subDir !== ".") agentWorkingDirRel = subDir;
+      }
+
+      const streamEditorCtx = {
+        activeFile: parsed.data.activeFile || null,
+        selection: parsed.data.selection || null,
+        cursorLine: parsed.data.cursorLine || null,
+      };
+
+      const projectCtx = {
+        name: project.name,
+        language: project.language,
+        framework: project.framework,
+        description: project.description || "",
+        workingDir: agentWorkingDirRel,
+        editorContext: streamEditorCtx.activeFile ? streamEditorCtx : undefined,
+      };
+
+      const maxIterationsMap: Record<string, number> = {
+        lite: 1, economy: 1, power: 4, agent: 8, max: 20, test: 6, optimize: 5,
+      };
+      const maxIter = maxIterationsMap[mode] ?? 4;
+
+      let totalUpdated = 0;
+      const allUpdatedPaths: string[] = [];
+      const allShellCommands: string[] = [];
+      let finalMsg = "";
+      let done = false;
+      let iter = 0;
+      let shellResults: Array<{ command: string; stdout: string; stderr: string; exitCode: number }> = [];
+
+      while (!done && iter < maxIter && !clientDisconnected) {
+        iter++;
+        sendEvent("status", { phase: "executing", iteration: iter, maxIterations: maxIter });
+
+        const response = await runAgentIteration(
+          parsed.data.content,
+          projectCtx,
+          allFiles.map((f: any) => ({ path: f.path, content: f.content })),
+          history.map((m: any) => ({ role: m.role, content: m.content })),
+          shellResults.length > 0 ? shellResults : undefined,
+          { mode, modelOverride: autoModel }
+        );
+
+        if (response.message) {
+          finalMsg = response.message;
+          sendEvent("text", { content: response.message });
+        }
+
+        if (response.fileUpdates && response.fileUpdates.length > 0) {
+          for (const fu of response.fileUpdates) {
+            const existing = allFiles.find((f: any) => f.path === fu.path);
+            const oldContent = existing ? existing.content : null;
+            sendEvent("action", { type: "edit", path: fu.path });
+            if (existing) {
+              await storage.updateFile(existing.id, fu.content);
+              (existing as any).content = fu.content;
+            } else {
+              const newFile = await storage.createFile({
+                projectId,
+                name: path.basename(fu.path),
+                path: fu.path,
+                content: fu.content,
+                type: "file",
+                language: path.extname(fu.path).replace(".", "") || "text",
+              });
+              (allFiles as any[]).push(newFile);
+            }
+            await writeProjectFile(projectId, fu.path, fu.content);
+            allUpdatedPaths.push(fu.path);
+            totalUpdated++;
+            sendEvent("file_diff", {
+              path: fu.path,
+              oldContent: oldContent,
+              newContent: fu.content,
+              isNew: oldContent === null,
+            });
+          }
+        }
+
+        shellResults = [];
+        if (response.shellCommands && response.shellCommands.length > 0) {
+          for (const cmd of response.shellCommands) {
+            sendEvent("action", { type: "shell", command: cmd });
+            allShellCommands.push(cmd);
+            const projectDir = getProjectDir(projectId);
+            const secrets = await storage.getSecrets(projectId);
+            const shellEnv: Record<string, string> = {};
+            for (const s of secrets) shellEnv[s.key] = s.value;
+            try {
+              const result = await execShell(projectId, cmd, projectDir, shellEnv);
+              shellResults.push({ command: cmd, ...result });
+              sendEvent("shell_output", {
+                command: cmd,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                exitCode: result.exitCode,
+              });
+              if (result.exitCode !== 0) {
+                sendEvent("action", { type: "error", message: `Command failed: ${cmd}`, command: cmd, stderr: result.stderr });
+              }
+            } catch (err: any) {
+              shellResults.push({ command: cmd, stdout: "", stderr: err.message, exitCode: 1 });
+              sendEvent("shell_output", {
+                command: cmd,
+                stdout: "",
+                stderr: err.message,
+                exitCode: 1,
+              });
+              sendEvent("action", { type: "error", message: err.message, command: cmd, stderr: err.message });
+            }
+          }
+        }
+
+        done = response.done || false;
+      }
+
+      if (totalUpdated > 0) {
+        try {
+          await gitCommit(projectId, `Agent: updated ${allUpdatedPaths.join(", ")}`);
+          sendEvent("action", { type: "checkpoint" });
+        } catch (_) {}
+      }
+
+      const cleanMsg = finalMsg
+        .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+        .replace(/AGENT_ACTION:\s*```?(?:json)?\s*\{[\s\S]*?\}\s*```?/gi, "")
+        .replace(/```json\s*\{[\s\S]*?"message"[\s\S]*?"done"[\s\S]*?\}\s*```/gi, "")
+        .replace(/^\s*\{[\s\S]*?"message"[\s\S]*?"done"\s*:[\s\S]*?\}\s*$/gm, "")
+        .trim();
+
+      const aiMsg = await storage.createMessage({ projectId, role: "assistant", content: cleanMsg || finalMsg });
+      sendEvent("complete", {
+        assistant: aiMsg,
+        filesUpdated: totalUpdated,
+        updatedPaths: allUpdatedPaths,
+        shellCommandsRun: allShellCommands,
+        modelLabel,
+      });
+      res.write("event: done\ndata: {}\n\n");
+      res.end();
+    } catch (err: any) {
+      sendEvent("error", { message: err.message });
+      res.end();
+    }
   });
 
   // ── AUTONOMY CONTINUE / EXECUTE ──────────────────────────────────────────
@@ -537,30 +937,47 @@ export async function registerRoutes(
       description: project.description || "", workingDir: agentWorkingDirRel,
     };
 
-    // Run a batch of 2-4 iterations
+    // Detect mode from session ID prefix
+    const isMaxMode = sessionId.startsWith("max_");
+    const sessionMode: AgentMode = isMaxMode ? "max" : "agent";
+    const { model: sessionModel, label: sessionModelLabel } = selectModelForMode(sessionMode);
+
     const remaining = session.totalIterations - session.iterationsDone;
-    const batchSize = Math.min(action === "execute" ? 4 : 2, remaining);
 
-    await storage.createLog({ projectId, type: "system", message: `▶️ Continuing... (iterations ${session.iterationsDone + 1}–${session.iterationsDone + batchSize} of ${session.totalIterations})`, stage: "agent" });
+    // Max mode: run 5 iterations per batch (auto-continues from UI without user input)
+    // Agent mode: run 2-4 iterations then show checkpoint to user
+    const batchSize = isMaxMode ? Math.min(5, remaining) : Math.min(action === "execute" ? 4 : 2, remaining);
 
-    const { finalMessage, filesUpdated, done: batchDone, stoppedAtIteration } = await runAgentBatch(
-      projectId, session.userMessage, projectCtx, "autonomy", session.iterationsDone, batchSize
+    const progressMsg = isMaxMode
+      ? `🚀 Max mode running... (${session.iterationsDone + 1}–${session.iterationsDone + batchSize} of ${session.totalIterations} · ${sessionModelLabel})`
+      : `▶️ Continuing... (iterations ${session.iterationsDone + 1}–${session.iterationsDone + batchSize} of ${session.totalIterations} · ${sessionModelLabel})`;
+
+    await storage.createLog({ projectId, type: "system", message: progressMsg, stage: "agent" });
+
+    const { finalMessage, filesUpdated, updatedPaths, shellCommandsRun, done: batchDone, stoppedAtIteration } = await runAgentBatch(
+      projectId, session.userMessage, projectCtx, sessionMode, session.iterationsDone, batchSize, undefined, sessionModel
     );
 
     session.iterationsDone = stoppedAtIteration;
-    session.expiresAt = Date.now() + 30 * 60 * 1000;
+    session.expiresAt = Date.now() + (isMaxMode ? 60 : 30) * 60 * 1000;
 
     const remainingAfter = session.totalIterations - session.iterationsDone;
     const isDone = batchDone || remainingAfter <= 0;
 
     if (isDone) {
       autonomySessions.delete(sessionId);
-      await storage.createLog({ projectId, type: "system", message: `✅ Autonomy agent complete`, stage: "agent" });
-      const aiMsg = await storage.createMessage({ projectId, role: "assistant", content: finalMessage });
-      return res.json({ status: "done", assistant: aiMsg, filesUpdated });
+      const doneMsg = isMaxMode ? `✅ Max agent complete — fully autonomous run finished` : `✅ Agent complete`;
+      await storage.createLog({ projectId, type: "system", message: doneMsg, stage: "agent" });
+      const cleanFinal = finalMessage
+        .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+        .replace(/AGENT_ACTION:\s*```?(?:json)?\s*\{[\s\S]*?\}\s*```?/gi, "")
+        .replace(/```json\s*\{[\s\S]*?"message"[\s\S]*?"done"[\s\S]*?\}\s*```/gi, "")
+        .replace(/^\s*\{[\s\S]*?"message"[\s\S]*?"done"\s*:[\s\S]*?\}\s*$/gm, "")
+        .trim();
+      const aiMsg = await storage.createMessage({ projectId, role: "assistant", content: cleanFinal || finalMessage });
+      return res.json({ status: "done", assistant: aiMsg, filesUpdated, updatedPaths, shellCommandsRun });
     }
 
-    // Checkpoint — ask user to continue
     await storage.createLog({
       projectId, type: "system",
       message: `__CHECKPOINT__${JSON.stringify({ iterationsDone: session.iterationsDone, totalIterations: session.totalIterations, summary: finalMessage.slice(0, 300) })}`,
@@ -573,8 +990,55 @@ export async function registerRoutes(
       iterationsDone: session.iterationsDone,
       totalIterations: session.totalIterations,
       filesUpdated,
+      updatedPaths,
+      shellCommandsRun,
       preview: finalMessage.slice(0, 400),
+      isMax: isMaxMode,
     });
+  });
+
+  app.post("/api/projects/:id/messages/explain-error", async (req, res) => {
+    const parsed = z.object({
+      command: z.string(),
+      stderr: z.string(),
+      exitCode: z.number().optional(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ message: "command and stderr required" });
+
+    const project = await storage.getProject(req.params.id);
+    if (!project) return res.status(404).json({ message: "Project not found" });
+
+    const allFiles = await storage.getFiles(req.params.id);
+    const fileList = allFiles.slice(0, 10).map(f => f.path).join(", ");
+
+    const prompt = `You are SudoAI, an expert debugger. A shell command failed in a ${project.language}/${project.framework} project.
+
+Command: ${parsed.data.command}
+Exit code: ${parsed.data.exitCode ?? 1}
+Error output:
+${parsed.data.stderr}
+
+Project files: ${fileList}
+
+Explain what went wrong in plain language, then provide a concrete fix. Be concise. Use markdown formatting.`;
+
+    try {
+      const { generateWithGemini } = await import("./gemini");
+      const explanation = await generateWithGemini(prompt, `Project: ${project.name}`);
+      const userMsg = await storage.createMessage({
+        projectId: req.params.id,
+        role: "user",
+        content: `Explain this error:\n\`\`\`\n$ ${parsed.data.command}\n${parsed.data.stderr}\n\`\`\``,
+      });
+      const aiMsg = await storage.createMessage({
+        projectId: req.params.id,
+        role: "assistant",
+        content: explanation,
+      });
+      res.json({ user: userMsg, assistant: aiMsg });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
   });
 
   app.delete("/api/projects/:id/messages", async (req, res) => {
@@ -614,7 +1078,9 @@ export async function registerRoutes(
     const files = await storage.getFiles(req.params.id);
     await syncProjectFiles(req.params.id, files.filter(f => f.type === "file").map(f => ({ path: f.path, content: f.content })));
 
-    // Detect correct working directory — ZIP imports can have files under a subfolder
+    const runtime = detectProjectRuntime(files);
+    await storage.createLog({ projectId: req.params.id, type: "system", message: `${runtime.icon} Detected runtime: ${runtime.language}/${runtime.framework}${runtime.version ? ` (${runtime.version})` : ""}`, stage: "console" });
+
     const projectRootDir = getProjectDir(req.params.id);
     let workingDir = projectRootDir;
     const pkgFile = files.find(f => f.name === "package.json" || f.path.endsWith("/package.json") || f.path === "package.json");
@@ -626,7 +1092,10 @@ export async function registerRoutes(
       }
     }
 
-    const installCmds = detectInstallCommands(files, workingDir);
+    const installCmds: string[] = [...detectInstallCommands(files, workingDir)];
+    if (installCmds.length === 0 && runtime.installCommand && runtime.language !== "javascript" && runtime.language !== "typescript") {
+      installCmds.push(runtime.installCommand);
+    }
     for (const installCmd of installCmds) {
       await storage.createLog({ projectId: req.params.id, type: "system", message: `📦 ${installCmd}`, stage: "console" });
       const installResult = await execShell(req.params.id, installCmd, workingDir);
@@ -651,18 +1120,70 @@ export async function registerRoutes(
 
     await storage.updateProject(req.params.id, { buildStatus: "running", status: "running" });
 
+    const label = (req.body as any)?.label || "main";
     const result = await startProcess(req.params.id, cmd, { ...env, PWD: workingDir }, async (msg, type) => {
-      await storage.createLog({ projectId: req.params.id, type, message: msg, stage: "console" });
-    });
+      await storage.createLog({ projectId: req.params.id, type, message: msg, stage: "console", processLabel: label });
+    }, workingDir, label);
+
+    res.json(result);
+  });
+
+  app.post("/api/projects/:id/run-service", async (req, res) => {
+    const project = await storage.getProject(req.params.id);
+    if (!project) return res.status(404).json({ message: "Not found" });
+
+    const { command, label } = req.body as { command?: string; label?: string };
+    if (!command || !label) return res.status(400).json({ message: "command and label are required" });
+
+    const secrets = await storage.getSecrets(req.params.id);
+    const env: Record<string, string> = {};
+    for (const s of secrets) env[s.key] = s.value;
+
+    const projectRootDir = getProjectDir(req.params.id);
+
+    await storage.createLog({ projectId: req.params.id, type: "system", message: `▶ Starting service "${label}": ${command}`, stage: "console", processLabel: label });
+
+    const result = await startProcess(req.params.id, command, { ...env, PWD: projectRootDir }, async (msg, type) => {
+      await storage.createLog({ projectId: req.params.id, type, message: msg, stage: "console", processLabel: label });
+    }, projectRootDir, label);
 
     res.json(result);
   });
 
   app.post("/api/projects/:id/stop", async (req, res) => {
-    await killProcess(req.params.id);
-    await storage.updateProject(req.params.id, { buildStatus: "idle", status: "idle" });
-    await storage.createLog({ projectId: req.params.id, type: "system", message: "⏹ App stopped.", stage: "console" });
+    const label = (req.body as any)?.label;
+    if (label) {
+      await killProcess(req.params.id, label);
+      await storage.createLog({ projectId: req.params.id, type: "system", message: `⏹ Service "${label}" stopped.`, stage: "console", processLabel: label });
+      const remaining = getProcesses(req.params.id);
+      if (remaining.length === 0) {
+        await storage.updateProject(req.params.id, { buildStatus: "idle", status: "idle" });
+      }
+    } else {
+      await killProcess(req.params.id);
+      await storage.updateProject(req.params.id, { buildStatus: "idle", status: "idle" });
+      await storage.createLog({ projectId: req.params.id, type: "system", message: "⏹ All services stopped.", stage: "console" });
+    }
     res.json({ success: true });
+  });
+
+  app.post("/api/projects/:id/restart-service", async (req, res) => {
+    const { label } = req.body as { label?: string };
+    if (!label) return res.status(400).json({ message: "label is required" });
+
+    const secrets = await storage.getSecrets(req.params.id);
+    const env: Record<string, string> = {};
+    for (const s of secrets) env[s.key] = s.value;
+
+    const projectRootDir = getProjectDir(req.params.id);
+
+    await storage.createLog({ projectId: req.params.id, type: "system", message: `🔄 Restarting service "${label}"...`, stage: "console", processLabel: label });
+
+    const result = await restartProcess(req.params.id, label, { ...env, PWD: projectRootDir }, async (msg, type) => {
+      await storage.createLog({ projectId: req.params.id, type, message: msg, stage: "console", processLabel: label });
+    }, projectRootDir);
+
+    res.json(result);
   });
 
   app.get("/api/projects/:id/status", async (req, res) => {
@@ -674,6 +1195,27 @@ export async function registerRoutes(
       command: proc?.command || null,
       startedAt: proc?.startedAt || null,
     });
+  });
+
+  app.get("/api/projects/:id/processes", async (req, res) => {
+    const procs = getProcesses(req.params.id);
+    res.json(procs.map(p => ({
+      label: p.label,
+      status: p.status,
+      port: p.port,
+      command: p.command,
+      startedAt: p.startedAt,
+      restartCount: p.restartCount,
+      uptime: Math.floor((Date.now() - p.startedAt.getTime()) / 1000),
+    })));
+  });
+
+  app.get("/api/projects/:id/runtime", async (req, res) => {
+    const project = await storage.getProject(req.params.id);
+    if (!project) return res.status(404).json({ message: "Not found" });
+    const files = await storage.getFiles(req.params.id);
+    const runtime = detectProjectRuntime(files);
+    res.json(runtime);
   });
 
   // /build is an alias for /run for backwards compatibility
@@ -877,6 +1419,135 @@ export async function registerRoutes(
     }
   });
 
+  // ────────── DATABASE ──────────
+  app.get("/api/projects/:id/database/tables", async (req, res) => {
+    const secrets = await storage.getSecrets(req.params.id);
+    const dbUrlSecret = secrets.find(s => s.key === "DATABASE_URL");
+    if (!dbUrlSecret) {
+      return res.json({ connected: false, tables: [], error: "No DATABASE_URL secret found" });
+    }
+
+    const pgLib = await import("pg");
+    const client = new pgLib.default.Client({ connectionString: dbUrlSecret.value });
+    try {
+      await client.connect();
+      await client.query("SET statement_timeout = '5s'");
+
+      const colsResult = await client.query(`
+        SELECT table_name, column_name as name, data_type as type, is_nullable = 'YES' as nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+        ORDER BY table_name, ordinal_position
+      `);
+
+      const tablesResult = await client.query(`
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+      `);
+
+      const colsByTable: Record<string, Array<{ name: string; type: string; nullable: boolean }>> = {};
+      for (const col of colsResult.rows) {
+        if (!colsByTable[col.table_name]) colsByTable[col.table_name] = [];
+        colsByTable[col.table_name].push({ name: col.name, type: col.type, nullable: col.nullable });
+      }
+
+      const tables = tablesResult.rows.map(r => ({
+        table_name: r.table_name,
+        row_count: null,
+        columns: colsByTable[r.table_name] || [],
+      }));
+
+      await client.end();
+      res.json({ connected: true, tables });
+    } catch (err: any) {
+      try { await client.end(); } catch (_) {}
+      res.json({ connected: false, tables: [], error: err.message });
+    }
+  });
+
+  app.post("/api/projects/:id/database/query", async (req, res) => {
+    const parsed = z.object({ query: z.string().min(1) }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ message: "Query required" });
+
+    const secrets = await storage.getSecrets(req.params.id);
+    const dbUrlSecret = secrets.find(s => s.key === "DATABASE_URL");
+    if (!dbUrlSecret) {
+      return res.status(400).json({ message: "No DATABASE_URL secret configured for this project" });
+    }
+
+    const sql = parsed.data.query.trim();
+    const stripped = sql.replace(/\/\*[\s\S]*?\*\//g, "").replace(/--.*$/gm, "").trim();
+    const upper = stripped.toUpperCase();
+    const allowed = /^(SELECT|INSERT|UPDATE|DELETE|WITH|EXPLAIN)\b/i;
+    if (!allowed.test(stripped)) {
+      return res.status(403).json({ message: "Only SELECT, INSERT, UPDATE, DELETE, WITH, and EXPLAIN queries are allowed" });
+    }
+    if (stripped.includes(";") && stripped.indexOf(";") < stripped.length - 1) {
+      return res.status(403).json({ message: "Multiple statements are not allowed" });
+    }
+
+    const pgLib = await import("pg");
+    const client = new pgLib.default.Client({ connectionString: dbUrlSecret.value });
+    try {
+      await client.connect();
+      await client.query("SET statement_timeout = '10s'");
+      const start = Date.now();
+      const result = await client.query(sql);
+      const duration = Date.now() - start;
+      await client.end();
+
+      const rows = (result.rows || []).slice(0, 500);
+      const fields = result.fields ? result.fields.map(f => f.name) : [];
+      res.json({
+        rows,
+        fields,
+        rowCount: result.rowCount ?? 0,
+        duration,
+        truncated: (result.rows || []).length > 500,
+      });
+    } catch (err: any) {
+      try { await client.end(); } catch (_) {}
+      res.status(400).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/projects/:id/database/provision", async (req, res) => {
+    const projectId = req.params.id;
+    const project = await storage.getProject(projectId);
+    if (!project) return res.status(404).json({ message: "Project not found" });
+
+    const existing = await storage.getSecrets(projectId);
+    if (existing.find(s => s.key === "DATABASE_URL")) {
+      return res.json({ message: "Database already provisioned", alreadyExists: true });
+    }
+
+    const mainDbUrl = process.env.DATABASE_URL;
+    if (!mainDbUrl) {
+      return res.status(500).json({ message: "No DATABASE_URL available on the server" });
+    }
+
+    const schemaName = `project_${projectId.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 50)}`;
+    const pgLib = await import("pg");
+    const client = new pgLib.default.Client({ connectionString: mainDbUrl });
+    try {
+      await client.connect();
+      await client.query(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`);
+      await client.end();
+
+      const urlObj = new URL(mainDbUrl);
+      urlObj.searchParams.set("schema", schemaName);
+      const projectDbUrl = urlObj.toString();
+
+      await storage.createSecret({ projectId, key: "DATABASE_URL", value: projectDbUrl });
+
+      res.json({ message: "Database provisioned", schema: schemaName });
+    } catch (err: any) {
+      try { await client.end(); } catch (_) {}
+      res.status(500).json({ message: `Failed to provision: ${err.message}` });
+    }
+  });
+
   // ────────── SECRETS ──────────
   app.get("/api/projects/:id/secrets", async (req, res) => {
     const secrets = await storage.getSecrets(req.params.id);
@@ -910,7 +1581,7 @@ export async function registerRoutes(
   // ────────── PREVIEW ──────────
   app.get("/api/projects/:id/preview", async (req, res) => {
     const proc = getProcess(req.params.id);
-    if (proc && proc.port) {
+    if (proc) {
       return res.redirect(`/api/projects/${req.params.id}/proxy/`);
     }
 
@@ -918,7 +1589,7 @@ export async function registerRoutes(
     if (!project) return res.status(404).send("Project not found");
     const files = await storage.getFiles(req.params.id);
 
-    const indexHtml = files.find(f => f.name === "index.html");
+    const indexHtml = files.find(f => f.name === "index.html" && !f.path.includes("client/"));
     if (indexHtml) {
       return res.send(indexHtml.content);
     }
@@ -934,10 +1605,14 @@ export async function registerRoutes(
   app.use("/api/projects/:id/proxy", (req: Request, res: Response) => {
     const proc = getProcess(req.params.id);
     if (!proc || !proc.port) {
+      const isStarting = proc && !proc.port;
       return res.status(503).send(`
-        <html><body style="font-family:monospace;background:#0d1117;color:#e6edf3;padding:40px;text-align:center">
-          <h2>App not running</h2>
-          <p style="color:#8b949e">Click the ▶ Run button in the workspace to start your app.</p>
+        <html><head>${isStarting ? '<meta http-equiv="refresh" content="2">' : ''}</head>
+        <body style="font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;padding:40px;text-align:center;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:80vh">
+          ${isStarting ? '<div style="width:24px;height:24px;border:3px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:spin 1s linear infinite;margin-bottom:16px"></div>' : ''}
+          <h2 style="margin:0 0 8px;font-size:16px">${isStarting ? 'Starting up...' : 'App not running'}</h2>
+          <p style="color:#8b949e;font-size:13px;margin:0">${isStarting ? 'Your app is loading. This page will refresh automatically.' : 'Click the Run button in the workspace to start your app.'}</p>
+          <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
         </body></html>
       `);
     }
@@ -962,10 +1637,17 @@ export async function registerRoutes(
 
     proxyReq.on("error", () => {
       if (!res.headersSent) {
+        const currentProc = getProcess(req.params.id);
+        const stillStarting = currentProc && (currentProc.status === "starting" || currentProc.status === "running");
         res.status(502).send(`
-          <html><body style="font-family:monospace;background:#0d1117;color:#e6edf3;padding:40px;text-align:center">
-            <h2>Cannot connect to app</h2>
-            <p style="color:#8b949e">App is starting or crashed. Check the Console tab for logs.</p>
+          <html><head>${stillStarting ? '<meta http-equiv="refresh" content="2">' : ''}</head>
+          <body style="font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;padding:40px;text-align:center;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:80vh">
+            ${stillStarting
+              ? '<div style="width:24px;height:24px;border:3px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:spin 1s linear infinite;margin-bottom:16px"></div>'
+              : ''}
+            <h2 style="margin:0 0 8px;font-size:16px">${stillStarting ? 'Starting up...' : 'Cannot connect to app'}</h2>
+            <p style="color:#8b949e;font-size:13px;margin:0">${stillStarting ? 'Your app is loading. This page will refresh automatically.' : 'The app may have crashed. Check the Console tab for logs.'}</p>
+            <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
           </body></html>
         `);
       }

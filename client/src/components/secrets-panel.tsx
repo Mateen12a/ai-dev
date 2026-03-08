@@ -17,6 +17,7 @@ export default function SecretsPanel({ projectId }: SecretsPanelProps) {
   const [newKey, setNewKey] = useState("");
   const [newValue, setNewValue] = useState("");
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
+  const [revealedValues, setRevealedValues] = useState<Record<string, string>>({});
   const [adding, setAdding] = useState(false);
 
   const { data: secrets, isLoading } = useQuery<ProjectSecret[]>({
@@ -26,6 +27,15 @@ export default function SecretsPanel({ projectId }: SecretsPanelProps) {
       return res.json();
     },
   });
+
+  const fetchRawValue = async (secretId: string) => {
+    if (revealedValues[secretId]) return;
+    const res = await fetch(`/api/projects/${projectId}/secrets/raw`);
+    const raw: ProjectSecret[] = await res.json();
+    const map: Record<string, string> = {};
+    for (const s of raw) map[s.id] = s.value;
+    setRevealedValues(prev => ({ ...prev, ...map }));
+  };
 
   const addMutation = useMutation({
     mutationFn: async ({ key, value }: { key: string; value: string }) => {
@@ -117,18 +127,22 @@ export default function SecretsPanel({ projectId }: SecretsPanelProps) {
                 <div className="flex-1 min-w-0">
                   <p className="font-mono text-xs font-medium text-foreground">{secret.key}</p>
                   <p className="font-mono text-xs text-muted-foreground mt-0.5">
-                    {revealed.has(secret.id) ? secret.value : "••••••••••••"}
+                    {revealed.has(secret.id) ? (revealedValues[secret.id] || "Loading...") : "•••••••"}
                   </p>
                 </div>
                 <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                   <button
                     className="p-1 rounded hover:bg-muted"
-                    onClick={() => setRevealed(prev => {
-                      const next = new Set(prev);
-                      if (next.has(secret.id)) next.delete(secret.id);
-                      else next.add(secret.id);
-                      return next;
-                    })}
+                    onClick={() => {
+                      const isRevealed = revealed.has(secret.id);
+                      if (!isRevealed) fetchRawValue(secret.id);
+                      setRevealed(prev => {
+                        const next = new Set(prev);
+                        if (next.has(secret.id)) next.delete(secret.id);
+                        else next.add(secret.id);
+                        return next;
+                      });
+                    }}
                     data-testid={`button-toggle-secret-${secret.id}`}
                   >
                     {revealed.has(secret.id) ? <EyeOff className="w-3.5 h-3.5 text-muted-foreground" /> : <Eye className="w-3.5 h-3.5 text-muted-foreground" />}

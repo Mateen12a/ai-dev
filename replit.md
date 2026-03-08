@@ -1,103 +1,35 @@
 # SudoAI — AI Development Platform
 
 ## Overview
-A Replit-like AI-powered development platform. Users describe software with a prompt, and Gemini AI generates code, provides a live preview, real bash shell, secrets management, git version control, project management, and a full IDE workspace.
-
-## Architecture
-- **Frontend**: React + TypeScript + Tailwind CSS + shadcn/ui + Vite + Wouter + TanStack Query
-- **Backend**: Express.js (Node.js) + TypeScript
-- **Database**: PostgreSQL with Drizzle ORM
-- **AI Model**: Google Gemini 2.0 Flash (`gemini-2.0-flash`) — only model available on this API key tier; used for all AI calls
-- **Shell**: Real bash via Node.js `child_process.exec` (server/project-fs.ts)
-- **State Management**: TanStack React Query v5
-
-## Key Features
-
-### Home Page (`/`)
-- Prompt-based project creation ("What do you want to build?")
-- 16 templates across 5 categories (Backend, Full Stack, Frontend, AI/ML) — 8 shown in main grid, "Browse all (16)" opens a full modal with search + category filters
-- Recent projects list at bottom
-- Gemini AI generates appropriate project files based on prompt
-- GitHub and ZIP import
-
-### Projects Page (`/projects`)
-- Full listing of all projects in a searchable grid
-- Search/filter by project name
-- Delete with confirmation dialog
-- Click to open workspace
-
-### Workspace (`/workspace/:id`) — Full-screen Replit-like IDE
-- **Top bar**: Project name, Run/Stop, Preview, Config (opens `.agent.json`), Deploy, Home, Swap panels
-- **`.agent.json` run config**: Gear icon button opens or creates `.agent.json` in the editor. Fields: `run` (custom start command), `install`, `description`. Process manager reads this file first when determining how to run the project.
-- **Left icon sidebar** (48px): Files, Source Control (Git), Secrets, Deploy panels
-- **File Explorer**: Tree view, file creation/deletion
-- **Code Editor**: Multi-tab with unsaved indicator, line numbers, tab handling, Ctrl+S to save
-- **Bottom panel tabs** (Console + Shell only):
-  - **Console**: Live build/run logs from DB with auto-refresh
-  - **Shell**: Real bash terminal with auto-detection of project type, Run App and Install buttons, command history, cwd tracking
-- **AI Agent panel** (right side panel, 320px wide, collapsible):
-  - Powered by Gemini 2.0 Flash
-  - Agentic run-and-fix loop: writes files → runs shell commands → reads errors → fixes → up to 4 iterations
-  - Live status while thinking (polls project logs)
-  - Code block rendering with syntax highlighting
-  - File update indicators
-- **Swap panels**: Button to swap explorer and agent panel sides (left ↔ right)
-- **Preview panel** (togglable, replaces agent when active): iframe preview, refresh, open in new tab
-- **Git panel**: Real git status/log via git CLI, commit with message, commit history
-- **Secrets panel**: Per-project environment variables, stored securely in DB, injected into shell sessions
-- **Deploy panel**: One-click deployment with live URL
-
-## API Routes
-
-### Projects
-- `GET /api/projects` — list all
-- `POST /api/projects` — create (generates files via Gemini)
-- `PATCH /api/projects/:id` — update
-- `DELETE /api/projects/:id` — delete
-- `POST /api/projects/import/github` — clone GitHub repo
-- `POST /api/projects/import/zip` — extract ZIP file
-
-### Files
-- `GET /api/projects/:id/files` — list files
-- `POST /api/projects/:id/files` — create file
-- `PATCH /api/projects/:id/files/:fileId` — update content (syncs to filesystem)
-- `DELETE /api/projects/:id/files/:fileId` — delete
-
-### Shell (Real bash)
-- `POST /api/projects/:id/shell` — execute command in project's temp dir
-
-### Git
-- `GET /api/projects/:id/git/status` / `log` / `diff`
-- `POST /api/projects/:id/git/commit` / `init`
-
-### Secrets
-- `GET/POST/PATCH/DELETE /api/projects/:id/secrets`
-
-### AI Agent
-- `GET /api/projects/:id/messages` — chat history
-- `POST /api/projects/:id/messages` — send message (triggers agentic loop)
-- `DELETE /api/projects/:id/messages` — clear history
-
-### Preview / Build / Deploy
-- `GET /api/projects/:id/preview`
-- `POST /api/projects/:id/build` / `test` / `deploy`
-
-## Database Tables
-- `projects` — project metadata
-- `project_files` — file content per project
-- `ai_messages` — chat history per project
-- `build_logs` — console/build/agent logs per project (stage: console|build|agent)
-- `deployments` — deployment history
-- `project_secrets` — per-project key-value secrets
-- `git_commits` — git commit history
-
-## Project Filesystem
-- Projects get real directories at `/tmp/devforge-projects/:id/`
-- Files are synced to filesystem when saved
-- Shell commands run in project directory with secrets as env vars
-- Git repos initialized per project
+SudoAI is an AI-powered development platform, akin to Replit. It enables users to describe software using natural language prompts, upon which Gemini AI generates the necessary code. The platform provides a comprehensive development environment including a live preview, a real bash shell, secrets management, Git version control, project management tools, and a full IDE workspace. Its core vision is to democratize software development by making it accessible through AI-driven code generation and a streamlined development workflow.
 
 ## User Preferences
-- Dark/light mode toggle in global header
+- Dark/light theme toggle in workspace header (Sun/Moon icon), persisted in localStorage
+- CodeMirror editor switches between light and dark themes dynamically
 - Workspace is full-screen (no global sidebar)
 - Agent panel can be toggled and swapped to left or right side
+
+## System Architecture
+The platform is built with a modern web stack:
+- **Frontend**: React, TypeScript, Tailwind CSS, shadcn/ui, Vite, Wouter, and TanStack Query.
+- **Backend**: Express.js with Node.js and TypeScript.
+- **Database**: PostgreSQL with Drizzle ORM.
+- **AI Model**: Primarily Google Gemini 2.0 Flash (`gemini-2.0-flash`), with Claude (Anthropic) as an optional fallback.
+- **Shell & Terminal**: A real bash shell is provided via Node.js `child_process.exec`, and a real PTY terminal is implemented using `node-pty`.
+- **State Management**: TanStack React Query v5 handles client-side state.
+
+**Key Architectural Features:**
+- **AI Agent Modes**: The AI agent operates in 7 distinct modes (Lite, Economy, Power, Agent, Max, Test, Optimize), each automatically selecting the optimal Gemini model based on task complexity (Flash for speed, Pro for complex tasks and deep reasoning).
+- **Workspace IDE**: A full-screen, Replit-like IDE featuring a CodeMirror 6 editor with extensive language support, syntax highlighting, code folding, and advanced editing features. It includes a file explorer, integrated Git control, secrets management, and a deploy panel.
+- **Real-time Feedback**: The AI agent provides structured, real-time feedback during execution, showing actions like thinking, file edits, shell commands, and error detection through inline indicators.
+- **Process Management**: Supports running and managing multiple project processes with live logs and individual controls.
+- **Runtime Detection**: Automatically detects project languages (Node.js, Python, Go, Rust, Ruby, Java) and frameworks to configure appropriate run and install commands.
+- **Mobile Responsiveness**: Adapts the UI for smaller screens by collapsing sidebars, providing mobile-specific panel toggles, and optimizing information display.
+
+## External Dependencies
+- **Google Gemini API**: Used for AI code generation and agentic operations.
+- **Anthropic Claude API**: Serves as an optional AI provider fallback.
+- **PostgreSQL**: The primary relational database for storing project data, files, messages, and configurations.
+- **npm registry**: For package management and dependency resolution in Node.js projects.
+- **Git CLI**: Integrated for version control functionalities within the workspace.
+- **xterm.js**: Used for rendering the interactive terminal within the IDE.
